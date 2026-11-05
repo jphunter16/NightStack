@@ -18,7 +18,9 @@ def main(argv=None):
     ap.add_argument("--foreground", nargs="*", default=[], help="separate foreground exposures (same tripod spot)")
     ap.add_argument("--sky", default="sigma",
                     choices=["sigma", "winsor", "linear", "mad", "percentile", "median", "mean", "max"])
-    ap.add_argument("--ground", default="median", choices=["median", "sigma", "winsor", "mean"])
+    ap.add_argument("--ground", default="median", choices=["median", "sigma", "winsor", "mean", "best"])
+    ap.add_argument("--ground-frame", type=int, default=None,
+                    help="with --ground best: use this frame number (1-based) instead of the automatic pick")
     ap.add_argument("--kappa", type=float, default=2.5, help="rejection strength (sigma)")
     ap.add_argument("--weighting", default="quality", choices=["quality", "noise", "fwhm", "none"])
     ap.add_argument("--no-normalize", action="store_true", help="disable frame normalisation")
@@ -49,6 +51,7 @@ def main(argv=None):
     pr.foregrounds = expand(a.foreground)
     s = pr.settings
     s.kappa, s.weighting, s.demosaic = a.kappa, a.weighting, a.demosaic
+    s.ground_frame = a.ground_frame - 1 if a.ground_frame else None
     s.normalize, s.auto_reject = not a.no_normalize, not a.keep_bad_frames
     s.half_size, s.sky_method, s.ground_method, s.blend_mode = a.half, a.sky, a.ground, a.blend
     s.align_local = not a.no_lens_correction
@@ -70,6 +73,8 @@ def main(argv=None):
                 if r.ok and not r.enabled:
                     print(f"  frame {r.index + 1}: {r.message}")
         pr.stack(prog)
+        if pr.ground_choice:
+            print(f"\nForeground frame: {pr.ground_choice[0]}")
         fp = FinishParams(linear_output=a.linear, enhance_stars=a.enhance_stars,
                           remove_gradient=a.remove_gradient)
         if a.astro_stretch is not None:

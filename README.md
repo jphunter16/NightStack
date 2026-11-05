@@ -30,6 +30,7 @@ Stacker, with Siril-style calibration and stacking under the hood.
 | **Starry Landscape Stacker** | Dense local alignment for wide-angle lenses | Homography + smooth lens-distortion field |
 | **Starry Landscape Stacker** | Minimum-horizon-noise stacking | Validity-tracked sky + all-frames fill near the horizon |
 | **Sequator** | Freeze ground / separate foreground exposures (HDR blend) | Optional foreground photos, brightness-matched to the night frames |
+| **Photographer workflow** | Pick the one best foreground exposure | "Best single frame" foreground: automatic (closest to the consensus, sharp, low-noise) or your choice; the horizon band still uses the low-noise multi-frame stack |
 | **Sequator** | Enhance star light, reduce light pollution | "Enhance stars" slider; gradient removal |
 | **Sequator** | Time-lapse output, speed | Export all aligned frames; multi-core stacking |
 

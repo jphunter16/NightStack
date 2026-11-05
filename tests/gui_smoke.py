@@ -87,6 +87,13 @@ w.steps.setCurrentRow(4)
 wait()
 assert w.project.stacked
 shot("5_stack.png")
+w.ground_method.setCurrentIndex(w.ground_method.findData("best"))
+assert w.ground_pick.isVisible() and w.ground_pick.count() > 1
+w.do_stack()
+wait()
+assert w.project.ground_choice is not None
+print("best foreground frame:", w.project.ground_choice[0])
+shot("5c_best_frame.png")
 w.show_what.setCurrentIndex(3)
 shot("5b_count_map.png")
 w.show_what.setCurrentIndex(0)

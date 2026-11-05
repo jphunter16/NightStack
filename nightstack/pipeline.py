@@ -52,6 +52,7 @@ class Settings:
     weighting: str = "quality"       # none | quality | noise | fwhm
     auto_reject: bool = True         # drop blurry / cloudy frames automatically
     match_foreground: bool = True    # scale separate foreground photos to the night frames
+    ground_frame: Optional[int] = None  # "best single frame": chosen frame (None = automatic)
 
 
 @dataclass
@@ -90,6 +91,7 @@ class Project:
         self.final_mask: Optional[np.ndarray] = None
         self.n_sky = 0
         self.hot_count = 0
+        self.ground_choice = None        # (label, scores) of the frame used by "best single frame"
         self.prepared = self.aligned_ok = self.stacked = False
 
     # ------------------------------------------------------------------ housekeeping
@@ -334,6 +336,57 @@ class Project:
         progress(1.0, f"Aligned {sum(r.ok for r in res)} of {n} frames")
         return res
 
+    def score_ground_frames(self, cache, idx, scale=None) -> np.ndarray:
+        """Score each candidate foreground frame (lower = better).
+
+        A good frame looks like the consensus (median) of all frames - no headlights, people,
+        torch light or a bumped tripod - yet keeps the consensus's fine detail (not blurred).
+        """
+        if len(idx) == 1:
+            return np.zeros(1)
+        mask = self.final_mask if self.final_mask is not None else self.full_mask()
+        # Full-resolution tiles from the foreground (downsampling would hide slight blur).
+        H, W = mask.shape
+        t = 160
+        ground = mask <= 127
+        cand = []
+        for y in range(0, H - t, t):
+            for x in range(0, W - t, t):
+                if ground[y:y + t, x:x + t].mean() > 0.95:
+                    cand.append((y, x))
+        if len(cand) < 3:   # little or no foreground: use the whole frame
+            cand = [(y, x) for y in range(0, H - t, t) for x in range(0, W - t, t)]
+        rng = np.random.default_rng(0)
+        if len(cand) > 30:
+            cand = [cand[i] for i in rng.choice(len(cand), 30, replace=False)]
+        gm = np.ones((len(cand), t, t), bool)
+        lum = []
+        for k, i in enumerate(idx):
+            f = np.stack([np.asarray(cache.mm[i, y:y + t, x:x + t], np.float32) for y, x in cand])
+            if scale is not None:
+                f = f * scale[k]
+            lum.append(to_gray(f.reshape(-1, t, 3)).reshape(len(cand), t, t))
+        lum = np.stack([x.reshape(-1, t) for x in lum])   # tiles stacked vertically
+        gm = gm.reshape(-1, t)
+        med = np.median(lum, 0)
+        hp_med = med - cv2.GaussianBlur(med, (0, 0), 1.5)
+        b = hp_med[gm]
+        devs, noises, gains = [], [], []
+        for f in lum:
+            r = f - med
+            # Large-scale differences from the consensus: headlights, people, torch light, a shifted tripod.
+            devs.append(float(np.mean(np.abs(cv2.GaussianBlur(r, (0, 0), 2.0))[gm])))
+            # Per-frame noise.
+            rr = (r - cv2.GaussianBlur(r, (0, 0), 1.5))[gm]
+            noises.append(float(1.4826 * np.median(np.abs(rr - np.median(rr)))))
+            # Detail kept: regression of the frame's fine detail on the consensus detail.
+            # ~1 when sharp, < 1 when blurred; unlike a correlation it is not fooled by noise.
+            a = (f - cv2.GaussianBlur(f, (0, 0), 1.5))[gm]
+            gains.append(float(np.sum(a * b) / (np.sum(b * b) + 1e-12)))
+        n0 = float(np.median(noises)) + 1e-9
+        scores = [d / n0 + nz / n0 + 8.0 * abs(1.0 - g) for d, nz, g in zip(devs, noises, gains)]
+        return np.array(scores)
+
     def _grade_frames_weights_only(self):
         """Re-compute weights after the user changes the weighting mode (keeps their Use ticks)."""
         enabled = [r.enabled for r in self.align_results]
@@ -450,6 +503,22 @@ class Project:
             if self.fg is None or s.match_foreground:
                 lim = (0.5, 2.0) if self.fg is None else (1e-3, 1e3)
                 g_scale = [np.clip(target / np.maximum(m, 1e-7), *lim).astype(np.float32) for m in src]
+        best_pos = None
+        fill = None
+        self.ground_choice = None
+        if s.ground_method == "best":
+            progress(0.02, "Choosing the best foreground frame")
+            scores = self.score_ground_frames(g_cache, g_idx, g_scale)
+            if s.ground_frame is not None and s.ground_frame in g_idx:
+                best_pos = g_idx.index(s.ground_frame)
+                how = "your choice"
+            else:
+                best_pos = int(np.argmin(scores))
+                how = "auto"
+            names = self.foregrounds if self.fg is not None else self.lights
+            self.ground_choice = (f"{os.path.basename(names[g_idx[best_pos]])} ({how})", scores, g_idx[best_pos])
+            if len(g_idx) > 1:
+                fill = np.zeros((H, W, 3), np.float32)
         workers = max(1, min(4, (os.cpu_count() or 2)))
         nbytes = max(len(sky_idx), len(g_idx)) * W * 3 * 4 * 8
         step = int(np.clip(160e6 // max(nbytes, 1), 8, 256))
@@ -461,7 +530,12 @@ class Project:
             g = g_cache.rows(r0, r1, g_idx)
             if g_scale is not None:
                 g *= np.array(g_scale)[:, None, None, :]
-            gnd[r0:r1], _ = combine(g, None, s.ground_method, s.kappa)
+            if best_pos is not None:
+                gnd[r0:r1] = g[best_pos]
+                if fill is not None:
+                    fill[r0:r1], _ = combine(g, None, "median")
+            else:
+                gnd[r0:r1], _ = combine(g, None, s.ground_method, s.kappa)
             if s.mode == "trails":
                 t = self.orig.rows(r0, r1, enabled) if self.fg is not None else g
                 sky[r0:r1], _ = combine(t, None, "max")
@@ -493,7 +567,9 @@ class Project:
         progress(0.97, "Blending sky and foreground")
         self.n_sky = len(sky_idx)
         mode = "standard" if s.mode == "trails" else s.blend_mode
-        self.result, self.alpha = blend(sky, gnd, sky_mask, cnt, self.n_sky, mode, s.feather, s.horizon_strength)
+        self.result, self.alpha = blend(sky, gnd, sky_mask, cnt, self.n_sky, mode, s.feather, s.horizon_strength,
+                                        fill=fill)
+        del fill
         # keep the separate layers compactly (for previews / layer export)
         self.sky_stack, self.ground_stack, self.count = sky.astype(np.float16), gnd.astype(np.float16), cnt
         del sky, gnd

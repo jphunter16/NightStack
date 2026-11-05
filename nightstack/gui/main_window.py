@@ -829,7 +829,20 @@ class MainWindow(QMainWindow):
         self.sky_method = combo(SKY_METHODS, s.sky_method)
         f.addRow("Sky", self.sky_method)
         self.ground_method = combo(GROUND_METHODS, s.ground_method)
+        self.ground_method.setToolTip("Best single frame keeps moving trees, grass or water crisp instead of "
+                                      "averaging them into a blur (more noise - try Foreground smoothing in step 6).")
         f.addRow("Foreground", self.ground_method)
+        self.ground_pick = QComboBox()
+        self.ground_pick.setToolTip("Auto picks the frame closest to the consensus of all frames (no headlights, "
+                                    "people or bumps) that is also sharp and low-noise.")
+        shrink(self.ground_pick)
+        self.ground_pick_label = QLabel("Use frame")
+        f.addRow(self.ground_pick_label, self.ground_pick)
+        self.ground_info = QLabel("")
+        self.ground_info.setObjectName("Stat")
+        self.ground_info.setWordWrap(True)
+        f.addRow(self.ground_info)
+        self.ground_method.currentIndexChanged.connect(self.refresh_ground_pick)
         self.kappa = LabeledSlider(1.5, 4.0, s.kappa, 0.1, "{:.1f}σ")
         self.kappa.setToolTip("Lower = more aggressive rejection of planes/satellites (sigma methods)")
         f.addRow("Clip strength", self.kappa)
@@ -887,7 +900,28 @@ class MainWindow(QMainWindow):
         l.addWidget(nxt)
         return w
 
+    def refresh_ground_pick(self, *_):
+        """Fill the frame chooser (night frames, or separate foreground photos if any)."""
+        best = self.ground_method.currentData() == "best"
+        self.ground_pick.setVisible(best)
+        self.ground_pick_label.setVisible(best)
+        self.ground_info.setVisible(best and bool(self.ground_info.text()))
+        pr = self.project
+        names = pr.foregrounds if pr.foregrounds else pr.lights
+        cur = self.ground_pick.currentData()
+        self.ground_pick.blockSignals(True)
+        self.ground_pick.clear()
+        self.ground_pick.addItem("Auto (sharpest, cleanest)", None)
+        for i, n in enumerate(names):
+            if not pr.foregrounds and pr.align_results and not pr.align_results[i].enabled:
+                continue
+            self.ground_pick.addItem(f"{i + 1}.  {os.path.basename(n)}", i)
+        k = self.ground_pick.findData(cur)
+        self.ground_pick.setCurrentIndex(max(0, k))
+        self.ground_pick.blockSignals(False)
+
     def enter_stack(self):
+        self.refresh_ground_pick()
         self.viewer.edit_enabled = False
         self.viewer.set_tool(Tool.PAN)
         self.viewer.clear_overlays()
@@ -908,6 +942,7 @@ class MainWindow(QMainWindow):
         s.horizon_strength = self.horizon_strength.value()
         s.feather = self.feather.value()
         s.horizon_margin = self.margin.value()
+        s.ground_frame = self.ground_pick.currentData() if s.ground_method == "best" else None
         s.normalize = self.normalize.isChecked()
         s.match_foreground = self.match_fg.isChecked()
         if s.weighting != self.weighting.currentData() and self.project.align_results:
@@ -922,7 +957,11 @@ class MainWindow(QMainWindow):
             self.show_what.setCurrentIndex(0)
             self.show_stack_view()
             self.refresh_steps()
-            self.statusBar().showMessage("Stack complete! Fine-tune and save in step 6.")
+            ch = self.project.ground_choice
+            self.ground_info.setText(f"Foreground from: {ch[0]}" if ch else "")
+            self.ground_info.setVisible(bool(ch))
+            self.statusBar().showMessage("Stack complete! Fine-tune and save in step 6." +
+                                         (f"  Foreground: {ch[0]}" if ch else ""))
         self.run_task(lambda p: self.project.stack(p), done)
 
     def show_stack_view(self):

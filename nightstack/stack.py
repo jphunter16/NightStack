@@ -23,6 +23,7 @@ GROUND_METHODS = {
     "sigma": "Sigma-clipped mean",
     "winsor": "Winsorized sigma",
     "mean": "Mean  (lowest noise)",
+    "best": "Best single frame  (crisp trees / water)",
 }
 BLEND_MODES = {
     "min_noise": "Minimum horizon noise  (recommended)",
@@ -177,9 +178,17 @@ def soft_mask(mask_u8: np.ndarray, feather: float) -> np.ndarray:
 
 
 def blend(sky: np.ndarray, ground: np.ndarray, sky_mask: np.ndarray, count: np.ndarray, n_sky: int,
-          mode: str = "min_noise", feather: float = 4.0, strength: float = 1.0):
-    """Combine the aligned-sky stack and the fixed-ground stack. Returns (image, alpha)."""
+          mode: str = "min_noise", feather: float = 4.0, strength: float = 1.0,
+          fill: Optional[np.ndarray] = None):
+    """Combine the aligned-sky stack and the fixed-ground stack. Returns (image, alpha).
+
+    fill: what to use under the sky where aligned data is thin (just above the horizon).
+    Defaults to `ground`; when the foreground is a single frame, pass the multi-frame stack
+    here so that horizon band stays low-noise.
+    """
     m = (sky_mask > 127).astype(np.float32)
+    if fill is not None:
+        ground = fill + (1 - m)[..., None] * (ground - fill)  # single frame below, stack above
     if mode == "standard":
         alpha = soft_mask(sky_mask, feather) * (count > 0)
     else:
