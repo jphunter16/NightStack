@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QStackedWidget, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
-from ..imageio import ALL_EXTS, RAW_EXTS, is_supported, load_preview, resize_max
+from ..imageio import ALL_EXTS, DEMOSAIC, RAW_EXTS, is_supported, load_preview, resize_max
 from ..pipeline import Project
 from ..postprocess import FinishParams, apply_finish
 from ..skymask import stretch_for_display
@@ -273,6 +273,22 @@ class MainWindow(QMainWindow):
                       "chosen automatically - it keeps stars sharpest across the frame.")
         rb.clicked.connect(self.set_ref_from_list)
         l.addWidget(rb)
+        g = QGroupBox("Separate foreground photos (optional)")
+        gl = QVBoxLayout(g)
+        gl.addWidget(hint("A blue-hour shot or a long, low-ISO exposure of the landscape from the same "
+                          "tripod position gives a much cleaner foreground (Sequator-style HDR blend)."))
+        row = QHBoxLayout()
+        self.fg_label = QLabel("None")
+        self.fg_label.setObjectName("Stat")
+        row.addWidget(self.fg_label, 1)
+        fa = QPushButton("Add…")
+        fa.clicked.connect(lambda: self.add_cal("foregrounds"))
+        fc = QPushButton("Clear")
+        fc.clicked.connect(lambda: self.clear_cal("foregrounds"))
+        row.addWidget(fa)
+        row.addWidget(fc)
+        gl.addLayout(row)
+        l.addWidget(g)
         self.fast_mode = QCheckBox("Fast mode (half resolution, great for a quick test)")
         l.addWidget(self.fast_mode)
         self.photo_count = QLabel("")
@@ -405,6 +421,15 @@ class MainWindow(QMainWindow):
             row.addWidget(clr)
             gl.addLayout(row)
             l.addWidget(g)
+        g = QGroupBox("RAW conversion")
+        gf = QFormLayout(g)
+        self.demosaic = QComboBox()
+        for k, v in DEMOSAIC.items():
+            self.demosaic.addItem(v, k)
+        gf.addRow("Demosaic", shrink(self.demosaic))
+        gf.addRow(hint("When your photos and calibration frames are all RAW, darks and flats are applied to "
+                       "the raw sensor data before demosaicing (like Siril) for the cleanest result."))
+        l.addWidget(g)
         self.hot_cb = QCheckBox("Automatically remove hot && cold pixels")
         self.hot_cb.setChecked(True)
         self.hot_cb.setToolTip("Finds pixels that stay bright in the same spot on every frame (stars move, "
@@ -418,7 +443,8 @@ class MainWindow(QMainWindow):
 
     def add_cal(self, kind):
         start = self.qsettings.value("last_dir", os.path.expanduser("~/Pictures"))
-        files, _ = QFileDialog.getOpenFileNames(self, f"Add {kind}", start, FILTER)
+        title = {"foregrounds": "Add foreground photos"}.get(kind, f"Add {kind}")
+        files, _ = QFileDialog.getOpenFileNames(self, title, start, FILTER)
         self._add_files(files, kind)
 
     def clear_cal(self, kind):
@@ -427,7 +453,7 @@ class MainWindow(QMainWindow):
         self.refresh_calibration()
 
     def refresh_calibration(self):
-        for k, lab in self.cal_labels.items():
+        for k, lab in list(self.cal_labels.items()) + [("foregrounds", self.fg_label)]:
             n = len(getattr(self.project, k))
             lab.setText(f"{n} frame{'s' if n != 1 else ''}" if n else "None")
 
@@ -438,6 +464,7 @@ class MainWindow(QMainWindow):
         s = self.project.settings
         s.half_size = self.fast_mode.isChecked()
         s.hot_pixels = self.hot_cb.isChecked()
+        s.demosaic = self.demosaic.currentData()
 
         def job(progress):
             self.project.prepare(progress)
@@ -450,6 +477,8 @@ class MainWindow(QMainWindow):
             msg = f"Loaded {len(self.project.lights)} photos"
             if self.project.hot_count:
                 msg += f", repaired {self.project.hot_count:,} hot pixels"
+            if self.project.cfa_calibrated:
+                msg += ", calibrated on RAW sensor data"
             self.statusBar().showMessage(msg + ". Check the sky mask, then align.")
         self.run_task(job, done)
 
@@ -665,14 +694,28 @@ class MainWindow(QMainWindow):
         self.interp.addItem("Bicubic", "cubic")
         self.interp.addItem("Bilinear (fastest)", "linear")
         f.addRow("Resampling", shrink(self.interp))
+        self.auto_reject = QCheckBox("Skip bad frames automatically (blur, clouds, bumps)")
+        self.auto_reject.setChecked(True)
+        self.auto_reject.setToolTip("Measures star sharpness (FWHM), star shape, star count and sky brightness "
+                                    "for every frame and unticks the outliers. You can tick them back on.")
+        f.addRow(self.auto_reject)
         l.addLayout(f)
         self.align_btn = primary("Align stars")
         self.align_btn.clicked.connect(self.align)
         l.addWidget(self.align_btn)
-        self.align_table = QTableWidget(0, 4)
-        self.align_table.setHorizontalHeaderLabels(["Use", "Frame", "Stars", "Accuracy"])
+        self.align_table = QTableWidget(0, 6)
+        self.align_table.setHorizontalHeaderLabels(["Use", "Frame", "Stars", "Accuracy", "Sharpness", "Weight"])
         self.align_table.verticalHeader().hide()
-        self.align_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr = self.align_table.horizontalHeader()
+        for c in range(6):
+            hdr.setSectionResizeMode(c, QHeaderView.Stretch if c == 1 else QHeaderView.ResizeToContents)
+        self.align_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.align_table.setTextElideMode(Qt.ElideMiddle)
+        self.align_table.setWordWrap(False)
+        self.align_table.setHorizontalHeaderLabels(["", "Frame", "Stars", "Error", "FWHM", "Wt"])
+        for c, tip in enumerate(["Use this frame", "File name", "Stars matched", "Alignment error (pixels)",
+                                 "Star size - smaller is sharper", "Weight in the stack"]):
+            self.align_table.horizontalHeaderItem(c).setToolTip(tip)
         self.align_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.align_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.align_table.setMinimumHeight(260)
@@ -700,6 +743,8 @@ class MainWindow(QMainWindow):
         s = self.project.settings
         s.align_local = self.align_model.currentData()
         s.interp = self.interp.currentData()
+        s.auto_reject = self.auto_reject.isChecked()
+        s.weighting = self.weighting.currentData()
         self.run_task(lambda p: self.project.align(p), lambda _: self.after_align())
 
     def after_align(self):
@@ -716,22 +761,33 @@ class MainWindow(QMainWindow):
             t.setItem(i, 1, QTableWidgetItem(name))
             t.setItem(i, 2, QTableWidgetItem(str(r.n_inliers) if r.ok else "–"))
             if i == self.project.ref_idx:
-                acc = "reference"
+                acc = "ref"
             elif r.ok:
-                acc = f"{r.rms:.2f} px  ✓"
+                acc = f"{r.rms:.2f}"
             else:
-                acc = "✗ " + r.message
+                acc = "✗ failed"
             it = QTableWidgetItem(acc)
             it.setToolTip(r.message)
             if not r.ok:
                 it.setForeground(Qt.red)
             t.setItem(i, 3, it)
+            sh = QTableWidgetItem(f"{r.fwhm:.1f}" if r.fwhm else "–")
+            sh.setToolTip(f"Star FWHM {r.fwhm:.2f}px, roundness {r.roundness:.2f}, sky level {r.background:.4f}")
+            t.setItem(i, 4, sh)
+            t.setItem(i, 5, QTableWidgetItem(f"{r.weight:.2f}" if r.ok else "–"))
+            if not r.enabled and r.ok:
+                for c in range(1, 6):
+                    t.item(i, c).setForeground(Qt.darkYellow)
+                    t.item(i, c).setToolTip(r.message)
         t.blockSignals(False)
         ok = sum(r.ok for r in res)
         bad = len(res) - ok
+        skipped = [r for r in res if r.ok and not r.enabled]
         self.align_stat.setText(f"{ok} of {len(res)} frames aligned." +
                                 (f" {bad} frame(s) couldn't be aligned (clouds?) - they'll still help the "
-                                 "foreground." if bad else " Click a row to preview."))
+                                 "foreground." if bad else " Click a row to preview.") +
+                                (f"\n{len(skipped)} frame(s) auto-skipped (yellow) - hover for the reason, "
+                                 "tick to include anyway." if skipped else ""))
         self.refresh_steps()
         self.statusBar().showMessage("Alignment done. Continue to Stack.")
         t.selectRow(self.project.ref_idx)
@@ -777,6 +833,19 @@ class MainWindow(QMainWindow):
         self.kappa = LabeledSlider(1.5, 4.0, s.kappa, 0.1, "{:.1f}σ")
         self.kappa.setToolTip("Lower = more aggressive rejection of planes/satellites (sigma methods)")
         f.addRow("Clip strength", self.kappa)
+        self.normalize = QCheckBox("Normalize frames (match sky brightness)")
+        self.normalize.setChecked(True)
+        self.normalize.setToolTip("Siril-style background + scale normalisation: keeps rejection working when "
+                                  "skyglow, moonlight or haze changes during the sequence.")
+        f.addRow(self.normalize)
+        self.weighting = QComboBox()
+        for k, t in (("quality", "Quality (sharp, dark-sky frames count more)"), ("noise", "Noise"),
+                     ("fwhm", "Star sharpness"), ("none", "Equal")):
+            self.weighting.addItem(t, k)
+        f.addRow("Frame weights", shrink(self.weighting))
+        self.match_fg = QCheckBox("Match foreground photos to night brightness")
+        self.match_fg.setChecked(True)
+        f.addRow(self.match_fg)
         l.addWidget(g)
         g2 = QGroupBox("Horizon blending")
         f2 = QFormLayout(g2)
@@ -839,6 +908,11 @@ class MainWindow(QMainWindow):
         s.horizon_strength = self.horizon_strength.value()
         s.feather = self.feather.value()
         s.horizon_margin = self.margin.value()
+        s.normalize = self.normalize.isChecked()
+        s.match_foreground = self.match_fg.isChecked()
+        if s.weighting != self.weighting.currentData() and self.project.align_results:
+            s.weighting = self.weighting.currentData()
+            self.project._grade_frames_weights_only()
 
         def done(_):
             self.preview_src = None
@@ -896,6 +970,13 @@ class MainWindow(QMainWindow):
         f.addRow("Contrast", self.contrast)
         self.saturation = LabeledSlider(0, 2, 1.15, 0.05, "{:.2f}")
         f.addRow("Saturation", self.saturation)
+        self.tone = QComboBox()
+        self.tone.addItem("Natural (photographic)", "natural")
+        self.tone.addItem("Astro (asinh, keeps star colour)", "asinh")
+        f.addRow("Tone curve", shrink(self.tone))
+        self.asinh = LabeledSlider(1, 300, 30, 1, "{:.0f}")
+        self.asinh.setToolTip("Stretch strength for the Astro tone curve")
+        f.addRow("Astro stretch", self.asinh)
         l.addWidget(g)
         g2 = QGroupBox("Clean-up")
         f2 = QFormLayout(g2)
@@ -907,13 +988,24 @@ class MainWindow(QMainWindow):
         self.highlights = QCheckBox("Protect bright stars && lights")
         self.highlights.setChecked(True)
         f2.addRow(self.highlights)
+        self.grad_deg = QComboBox()
+        for d, t in ((1, "Simple (linear)"), (2, "Normal"), (3, "Complex"), (4, "Very complex")):
+            self.grad_deg.addItem(t, d)
+        self.grad_deg.setCurrentIndex(1)
+        f2.addRow("Gradient shape", shrink(self.grad_deg))
+        self.stars_boost = LabeledSlider(0, 1, 0, 0.05, "{:.0%}")
+        self.stars_boost.setToolTip("Brightens stars without touching the Milky Way glow or the ground")
+        f2.addRow("Enhance stars", self.stars_boost)
         self.sky_dn = LabeledSlider(0, 1, 0, 0.05, "{:.0%}")
         f2.addRow("Extra sky smoothing", self.sky_dn)
         self.gnd_dn = LabeledSlider(0, 1, 0, 0.05, "{:.0%}")
         f2.addRow("Foreground smoothing", self.gnd_dn)
         l.addWidget(g2)
-        for wdg in (self.exposure, self.black, self.contrast, self.saturation, self.sky_dn, self.gnd_dn):
+        for wdg in (self.exposure, self.black, self.contrast, self.saturation, self.sky_dn, self.gnd_dn,
+                    self.asinh, self.stars_boost):
             wdg.changed.connect(self.finish_timer.start)
+        for c in (self.tone, self.grad_deg):
+            c.currentIndexChanged.connect(self.finish_timer.start)
         for cb in (self.gradient, self.neutral, self.highlights):
             cb.toggled.connect(self.finish_timer.start)
         self.before_btn = QPushButton("Hold to compare with a single frame")
@@ -936,6 +1028,10 @@ class MainWindow(QMainWindow):
         f3.addRow(self.layers)
         l.addWidget(g3)
         l.addStretch(1)
+        self.frames_btn = QPushButton("Export aligned frames for a time-lapse…")
+        self.frames_btn.setToolTip("Saves every frame with the sky aligned and your finishing applied")
+        self.frames_btn.clicked.connect(self.export_frames)
+        l.addWidget(self.frames_btn)
         self.save_btn = primary("Save Image…")
         self.save_btn.clicked.connect(self.export)
         l.addWidget(self.save_btn)
@@ -946,7 +1042,9 @@ class MainWindow(QMainWindow):
                             saturation=self.saturation.value(), contrast=self.contrast.value(),
                             remove_gradient=self.gradient.isChecked(), neutralize=self.neutral.isChecked(),
                             sky_denoise=self.sky_dn.value(), ground_denoise=self.gnd_dn.value(),
-                            protect_highlights=self.highlights.isChecked(), linear_output=self.linear.isChecked())
+                            protect_highlights=self.highlights.isChecked(), linear_output=self.linear.isChecked(),
+                            gradient_degree=self.grad_deg.currentData(), enhance_stars=self.stars_boost.value(),
+                            tone=self.tone.currentData(), asinh_strength=self.asinh.value())
 
     def enter_finish(self):
         self.viewer.edit_enabled = False
@@ -997,6 +1095,19 @@ class MainWindow(QMainWindow):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
         self.run_task(lambda p: self.project.export(path, fp, bits=bits, layers=self.layers.isChecked(),
                                                     progress=p), done)
+
+    def export_frames(self):
+        if not self.project.stacked:
+            QMessageBox.information(self, APP_NAME, "Stack your photos first.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder for the frames",
+                                                  self.qsettings.value("save_dir", os.path.expanduser("~")))
+        if not folder:
+            return
+        fp = self.finish_params()
+        fp.linear_output = False
+        self.run_task(lambda p: self.project.export_frames(folder, fp, ".jpg", progress=p),
+                      lambda files: self.statusBar().showMessage(f"Saved {len(files)} frames to {folder}"))
 
     # ======================================================================= navigation
     def available(self, step: int) -> bool:

@@ -10,8 +10,9 @@ import cv2
 import numpy as np
 
 from . import align as _align
-from .calibration import HotPixelDetector, build_master, calibrate, fix_pixels, normalise_flat
-from .imageio import (FrameCache, load_image, new_cache_dir, remove_cache_dir, resize_max,
+from .calibration import (CFACalibrator, HotPixelDetector, build_master, build_master_cfa, calibrate, fix_pixels,
+                          normalise_flat, normalise_flat_cfa)
+from .imageio import (RAW_EXTS, FrameCache, load_cfa, load_image, new_cache_dir, remove_cache_dir, resize_max,
                       save_image, to_gray)
 from .postprocess import FinishParams, apply_finish, auto_exposure
 from .skymask import SkyMaskModel, auto_detect, stretch_for_display
@@ -46,6 +47,11 @@ class Settings:
     horizon_strength: float = 1.0
     kappa: float = 2.5
     max_align_stars: int = 800
+    demosaic: str = "AHD"
+    normalize: bool = True           # Siril-style per-frame background/scale normalisation
+    weighting: str = "quality"       # none | quality | noise | fwhm
+    auto_reject: bool = True         # drop blurry / cloudy frames automatically
+    match_foreground: bool = True    # scale separate foreground photos to the night frames
 
 
 @dataclass
@@ -63,11 +69,14 @@ class Project:
         self.darks: List[str] = []
         self.flats: List[str] = []
         self.biases: List[str] = []
+        self.foregrounds: List[str] = []   # optional separate foreground exposures (blue hour, long exposure)
         self.settings = Settings()
         self.cache_dir: Optional[str] = None
         self.orig: Optional[FrameCache] = None
         self.aligned: Optional[FrameCache] = None
         self.valid: Optional[FrameCache] = None
+        self.fg: Optional[FrameCache] = None
+        self.cfa_calibrated = False
         self.shape = None
         self.ref_idx = 0
         self.ref_gray: Optional[np.ndarray] = None
@@ -85,10 +94,10 @@ class Project:
 
     # ------------------------------------------------------------------ housekeeping
     def cleanup(self):
-        for c in (self.orig, self.aligned, self.valid):
+        for c in (self.orig, self.aligned, self.valid, self.fg):
             if c is not None:
                 c.close()
-        self.orig = self.aligned = self.valid = None
+        self.orig = self.aligned = self.valid = self.fg = None
         if self.cache_dir:
             remove_cache_dir(self.cache_dir)
         self.cache_dir = None
@@ -101,6 +110,9 @@ class Project:
         self.stacked = False
 
     # ------------------------------------------------------------------ step 1/2: load & calibrate
+    def _all_raw(self, paths) -> bool:
+        return bool(paths) and all(os.path.splitext(p)[1].lower() in RAW_EXTS for p in paths)
+
     def prepare(self, progress: Progress = _noop):
         if len(self.lights) == 0:
             raise ValueError("Add some photos first.")
@@ -110,17 +122,42 @@ class Project:
         n = len(self.lights)
         has_cal = bool(self.darks or self.flats or self.biases)
         span = 0.25 if has_cal else 0.0
-        bias = build_master(self.biases, self.cache_dir, "bias", s.half_size, progress=progress,
-                            p0=0, p1=span / 3) if self.biases else None
-        dark = build_master(self.darks, self.cache_dir, "dark", s.half_size, progress=progress,
-                            p0=span / 3, p1=2 * span / 3) if self.darks else None
-        flat = build_master(self.flats, self.cache_dir, "flat", s.half_size, subtract=bias,
-                            progress=progress, p0=2 * span / 3, p1=span) if self.flats else None
-        flat_norm = normalise_flat(flat) if flat is not None else None
+        cal_paths = self.darks + self.flats + self.biases
+        # Siril-style: calibrate on the raw Bayer data before demosaicing when everything is RAW.
+        use_cfa = has_cal and not s.half_size and self._all_raw(self.lights) and self._all_raw(cal_paths)
+        self.cfa_calibrated = use_cfa
+        bias = dark = flat_norm = None
+        cfa_cal = None
+        if use_cfa:
+            bias = build_master_cfa(self.biases, self.cache_dir, "bias", progress=progress, p0=0, p1=span / 3)
+            dark = build_master_cfa(self.darks, self.cache_dir, "dark", progress=progress,
+                                    p0=span / 3, p1=2 * span / 3)
+            flat = build_master_cfa(self.flats, self.cache_dir, "flat", subtract=bias, progress=progress,
+                                    p0=2 * span / 3, p1=span)
+            if flat is not None:
+                flat_norm = normalise_flat_cfa(flat, load_cfa(self.flats[0])[1])
+            ref_shape = load_cfa(self.lights[0])[0].shape
+            for name, m in (("dark", dark), ("bias", bias), ("flat", flat_norm)):
+                if m is not None and m.shape != ref_shape:
+                    raise ValueError(f"The {name} frames ({m.shape[1]}x{m.shape[0]}) come from a different "
+                                     f"camera/mode than the photos.")
+            cfa_cal = CFACalibrator(bias, dark, flat_norm)
+            bias = dark = flat_norm = None   # already applied on the raw data
+        else:
+            bias = build_master(self.biases, self.cache_dir, "bias", s.half_size, progress=progress,
+                                p0=0, p1=span / 3) if self.biases else None
+            dark = build_master(self.darks, self.cache_dir, "dark", s.half_size, progress=progress,
+                                p0=span / 3, p1=2 * span / 3) if self.darks else None
+            flat = build_master(self.flats, self.cache_dir, "flat", s.half_size, subtract=bias,
+                                progress=progress, p0=2 * span / 3, p1=span) if self.flats else None
+            flat_norm = normalise_flat(flat) if flat is not None else None
 
-        first = load_image(self.lights[0], s.half_size)
+        def load(p):
+            return load_image(p, s.half_size, s.demosaic, cfa_cal)
+
+        first = load(self.lights[0])
         H, W, _ = first.shape
-        for name, m in (("dark", dark), ("bias", bias), ("flat", flat)):
+        for name, m in (("dark", dark), ("bias", bias), ("flat", flat_norm)):
             if m is not None and m.shape != first.shape:
                 raise ValueError(f"The master {name} ({m.shape[1]}x{m.shape[0]}) does not match the "
                                  f"photos ({W}x{H}).")
@@ -130,9 +167,10 @@ class Project:
         self.smalls = []
         sw = 640
         sh = max(8, int(round(H * sw / W)))
+        end = 0.68 if self.foregrounds else 0.75
         for i, p in enumerate(self.lights):
-            progress(span + (0.75 - span) * i / n, f"Loading photo {i + 1} of {n}: {os.path.basename(p)}")
-            img = first if i == 0 else load_image(p, s.half_size)
+            progress(span + (end - span) * i / n, f"Loading photo {i + 1} of {n}: {os.path.basename(p)}")
+            img = first if i == 0 else load(p)
             if img.shape != first.shape:
                 raise ValueError(f"{os.path.basename(p)} is {img.shape[1]}x{img.shape[0]} but the first photo "
                                  f"is {W}x{H}. All photos must be the same size/orientation.")
@@ -142,16 +180,29 @@ class Project:
             self.orig.write(i, img)
             self.smalls.append(cv2.resize(to_gray(img), (sw, sh), interpolation=cv2.INTER_AREA))
         del first
-        if hot is not None:
-            bad = hot.hot_map()
-            self.hot_count = int(bad.any(-1).sum())
-            if self.hot_count:
-                for i in range(n):
-                    progress(0.75 + 0.15 * i / n, f"Removing {self.hot_count:,} hot pixels ({i + 1}/{n})")
-                    self.orig.write(i, fix_pixels(self.orig.read(i), bad))
+        bad = hot.hot_map() if hot is not None else None
+        self.hot_count = int(bad.any(-1).sum()) if bad is not None else 0
+        if self.hot_count:
+            for i in range(n):
+                progress(end + 0.12 * i / n, f"Removing {self.hot_count:,} hot pixels ({i + 1}/{n})")
+                self.orig.write(i, fix_pixels(self.orig.read(i), bad))
+            if n <= 60:
                 self.smalls = [cv2.resize(to_gray(self.orig.read(i)), (sw, sh), interpolation=cv2.INTER_AREA)
-                               for i in range(n)] if n <= 60 else self.smalls
+                               for i in range(n)]
         self.orig.flush()
+        if self.foregrounds:
+            nf = len(self.foregrounds)
+            self.fg = FrameCache(self.cache_dir, "foreground", nf, H, W)
+            for i, p in enumerate(self.foregrounds):
+                progress(0.82 + 0.1 * i / nf, f"Loading foreground photo {i + 1} of {nf}")
+                img = load_image(p, s.half_size, s.demosaic)
+                if img.shape != (H, W, 3):
+                    raise ValueError(f"Foreground photo {os.path.basename(p)} is a different size than the "
+                                     "night photos. Shoot it from the same tripod position and camera mode.")
+                if self.hot_count:
+                    img = fix_pixels(img, bad)
+                self.fg.write(i, img)
+            self.fg.flush()
         self.set_reference(s.ref_index if s.ref_index is not None else n // 2, progress)
         self.prepared = True
         self.invalidate("mask")
@@ -277,10 +328,63 @@ class Project:
         self.aligned.flush()
         self.valid.flush()
         self.align_results = res
+        self._grade_frames()
         self.aligned_ok = True
         self.stacked = False
         progress(1.0, f"Aligned {sum(r.ok for r in res)} of {n} frames")
         return res
+
+    def _grade_frames_weights_only(self):
+        """Re-compute weights after the user changes the weighting mode (keeps their Use ticks)."""
+        enabled = [r.enabled for r in self.align_results]
+        msgs = [r.message for r in self.align_results]
+        auto = self.settings.auto_reject
+        self.settings.auto_reject = False
+        self._grade_frames()
+        self.settings.auto_reject = auto
+        for r, e, m in zip(self.align_results, enabled, msgs):
+            r.enabled, r.message = e, m
+
+    def _grade_frames(self):
+        """Weights + automatic rejection of blurry / trailed / cloudy frames (Siril-style)."""
+        res = self.align_results
+        ok = [r for r in res if r.ok]
+        if not ok:
+            return
+        fw = np.array([r.fwhm for r in ok])
+        bg = np.array([r.background for r in ok])
+        nz = np.array([max(r.noise, 1e-9) for r in ok])
+        ns = np.array([r.n_inliers for r in ok])
+        mf, mb, mn = np.median(fw), np.median(bg), np.median(ns)
+        sb = 1.4826 * np.median(np.abs(bg - mb)) + 1e-9
+        for r in res:
+            if not r.ok:
+                continue
+            if self.settings.weighting == "quality":
+                # Sky-limited photon noise grows with background brightness; blur spreads star light.
+                # (Measured pixel noise would reward blurry frames, so it isn't used here.)
+                r.weight = float((mb / max(r.background, 1e-9)) * (mf / max(r.fwhm, 1e-3)) ** 2)
+            elif self.settings.weighting == "noise":
+                r.weight = float((np.median(nz) / max(r.noise, 1e-9)) ** 2)
+            elif self.settings.weighting == "fwhm":
+                r.weight = float((mf / max(r.fwhm, 1e-3)) ** 2)
+            else:
+                r.weight = 1.0
+            r.weight = float(np.clip(r.weight, 0.2, 5.0))
+            if not self.settings.auto_reject or len(ok) < 5 or r.index == self.ref_idx:
+                continue
+            reason = None
+            if r.fwhm > 1.45 * mf:
+                reason = "blurry stars (wind, focus or dew?)"
+            elif r.roundness < 0.55:
+                reason = "stretched stars (camera bumped?)"
+            elif r.n_inliers < 0.4 * mn:
+                reason = "few stars visible (clouds?)"
+            elif r.background > mb + max(6 * sb, 0.6 * mb):
+                reason = "bright sky (clouds, moon or car lights?)"
+            if reason:
+                r.enabled = False
+                r.message = "Auto-skipped: " + reason
 
     # ------------------------------------------------------------------ step 5: stack
     def stack(self, progress: Progress = _noop):
@@ -309,26 +413,70 @@ class Project:
         sky = np.zeros((H, W, 3), np.float32)
         gnd = np.zeros((H, W, 3), np.float32)
         cnt = np.zeros((H, W), np.float32)
+        progress(0.0, "Measuring frames")
+        sub = (slice(None, None, 8), slice(None, None, 8))
+        gmask = self.final_mask[sub] <= 127
+        if gmask.sum() < 50:
+            gmask = np.ones_like(gmask)
+
+        def chan_stats(arr, m):
+            px = arr[m] if m.any() else arr.reshape(-1, 3)
+            loc = np.median(px, 0)
+            return loc, 1.4826 * np.median(np.abs(px - loc), 0) + 1e-7
+
+        # Sky normalisation (Siril "additive with scaling"): match every frame's background level and
+        # spread to the reference so changing skyglow / transparency doesn't fight the rejection.
+        sky_norm = None
+        sky_w = None
+        if s.mode == "landscape":
+            if s.normalize:
+                stats = [chan_stats(np.asarray(self.aligned.mm[i][sub], np.float32),
+                                    np.asarray(vtmp.mm[j][sub]) > 0) for j, i in enumerate(sky_idx)]
+                rj = sky_idx.index(self.ref_idx) if self.ref_idx in sky_idx else 0
+                L0, S0 = stats[rj]
+                sky_norm = [(L, np.clip(S0 / S, 0.5, 2.0), L0) for L, S in stats]
+            sky_w = np.array([self.align_results[i].weight for i in sky_idx], np.float32) \
+                if s.weighting != "none" else None
+        # Foreground source: separate foreground photos if given, else the night frames themselves.
+        g_cache = self.fg if self.fg is not None else self.orig
+        g_idx = list(range(self.fg.n)) if self.fg is not None else enabled
+        g_scale = None
+        if s.normalize or (self.fg is not None and s.match_foreground):
+            night = [chan_stats(np.asarray(self.orig.mm[i][sub], np.float32), gmask)[0] for i in enabled]
+            target = np.median(np.array(night), 0) if self.fg is not None else \
+                night[enabled.index(self.ref_idx)] if self.ref_idx in enabled else night[0]
+            src = night if self.fg is None else \
+                [chan_stats(np.asarray(self.fg.mm[i][sub], np.float32), gmask)[0] for i in g_idx]
+            if self.fg is None or s.match_foreground:
+                lim = (0.5, 2.0) if self.fg is None else (1e-3, 1e3)
+                g_scale = [np.clip(target / np.maximum(m, 1e-7), *lim).astype(np.float32) for m in src]
         workers = max(1, min(4, (os.cpu_count() or 2)))
-        nbytes = max(len(sky_idx), len(enabled)) * W * 3 * 4 * 8
+        nbytes = max(len(sky_idx), len(g_idx)) * W * 3 * 4 * 8
         step = int(np.clip(160e6 // max(nbytes, 1), 8, 256))
         strips = [(r0, min(H, r0 + step)) for r0 in range(0, H, step)]
         vmm = vtmp.mm if vtmp is not None else None
 
         def do_strip(r):
             r0, r1 = r
-            g = self.orig.rows(r0, r1, enabled)
+            g = g_cache.rows(r0, r1, g_idx)
+            if g_scale is not None:
+                g *= np.array(g_scale)[:, None, None, :]
             gnd[r0:r1], _ = combine(g, None, s.ground_method, s.kappa)
             if s.mode == "trails":
-                sky[r0:r1], _ = combine(g, None, "max")
+                t = self.orig.rows(r0, r1, enabled) if self.fg is not None else g
+                sky[r0:r1], _ = combine(t, None, "max")
                 cnt[r0:r1] = len(enabled)
             else:
                 del g
                 d = self.aligned.rows(r0, r1, sky_idx)
+                if sky_norm is not None:
+                    for k, (L, kk, L0) in enumerate(sky_norm):
+                        d[k] = (d[k] - L) * kk + L0
                 v = np.asarray(vmm[:, r0:r1]) > 0
-                sky[r0:r1], cnt[r0:r1] = combine(d, v, s.sky_method, s.kappa)
+                sky[r0:r1], cnt[r0:r1] = combine(d, v, s.sky_method, s.kappa, weights=sky_w)
 
         from concurrent.futures import ThreadPoolExecutor
+        futures = []
         try:
             with ThreadPoolExecutor(workers) as ex:  # numpy releases the GIL: real multi-core speed-up
                 futures = [ex.submit(do_strip, r) for r in strips]
@@ -381,6 +529,26 @@ class Project:
             save_image(fp, self.final_mask.astype(np.float32) / 255.0, bits=8 if ext == ".png" else 16)
             written.append(fp)
         progress(1.0, "Saved")
+        return written
+
+    def export_frames(self, folder: str, params: FinishParams, ext: str = ".jpg", aligned: bool = True,
+                      progress: Progress = _noop):
+        """Sequator-style: save every frame (sky-aligned, foreground untouched) for time-lapses."""
+        os.makedirs(folder, exist_ok=True)
+        mask = self.final_mask if self.final_mask is not None else self.full_mask()
+        alpha = cv2.GaussianBlur((mask > 127).astype(np.float32), (0, 0), 1.5)[..., None]
+        written = []
+        n = len(self.lights)
+        for i in range(n):
+            progress(i / n, f"Saving frame {i + 1} of {n}")
+            img = self.orig.read(i)
+            r = self.align_results[i] if self.align_results else None
+            if aligned and r is not None and r.ok and self.aligned is not None:
+                img = alpha * self.aligned.read(i) + (1 - alpha) * img
+            fp = os.path.join(folder, f"frame_{i + 1:04d}{ext}")
+            save_image(fp, apply_finish(img, mask, params, display=False), bits=8 if ext == ".jpg" else 16)
+            written.append(fp)
+        progress(1.0, "Frames saved")
         return written
 
     def summary(self) -> dict:

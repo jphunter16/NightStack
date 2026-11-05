@@ -15,8 +15,19 @@ def main(argv=None):
     ap.add_argument("--darks", nargs="*", default=[])
     ap.add_argument("--flats", nargs="*", default=[])
     ap.add_argument("--bias", nargs="*", default=[])
-    ap.add_argument("--sky", default="sigma", choices=["sigma", "median", "mean", "winsor", "max"])
-    ap.add_argument("--ground", default="median", choices=["median", "sigma", "mean"])
+    ap.add_argument("--foreground", nargs="*", default=[], help="separate foreground exposures (same tripod spot)")
+    ap.add_argument("--sky", default="sigma",
+                    choices=["sigma", "winsor", "linear", "mad", "percentile", "median", "mean", "max"])
+    ap.add_argument("--ground", default="median", choices=["median", "sigma", "winsor", "mean"])
+    ap.add_argument("--kappa", type=float, default=2.5, help="rejection strength (sigma)")
+    ap.add_argument("--weighting", default="quality", choices=["quality", "noise", "fwhm", "none"])
+    ap.add_argument("--no-normalize", action="store_true", help="disable frame normalisation")
+    ap.add_argument("--keep-bad-frames", action="store_true", help="disable automatic frame rejection")
+    ap.add_argument("--demosaic", default="AHD", choices=["AHD", "DCB", "DHT", "AAHD", "VNG", "PPG", "LINEAR"])
+    ap.add_argument("--enhance-stars", type=float, default=0.0, help="0..1")
+    ap.add_argument("--astro-stretch", type=float, default=None, help="use asinh tone curve with this strength")
+    ap.add_argument("--remove-gradient", action="store_true")
+    ap.add_argument("--timelapse", default=None, help="also save aligned frames into this folder")
     ap.add_argument("--blend", default="min_noise", choices=["min_noise", "standard"])
     ap.add_argument("--trails", action="store_true", help="star-trail (lighten) mode")
     ap.add_argument("--no-lens-correction", action="store_true")
@@ -35,7 +46,10 @@ def main(argv=None):
 
     pr = Project()
     pr.lights, pr.darks, pr.flats, pr.biases = expand(a.lights), expand(a.darks), expand(a.flats), expand(a.bias)
+    pr.foregrounds = expand(a.foreground)
     s = pr.settings
+    s.kappa, s.weighting, s.demosaic = a.kappa, a.weighting, a.demosaic
+    s.normalize, s.auto_reject = not a.no_normalize, not a.keep_bad_frames
     s.half_size, s.sky_method, s.ground_method, s.blend_mode = a.half, a.sky, a.ground, a.blend
     s.align_local = not a.no_lens_correction
     s.mode = "trails" if a.trails else "landscape"
@@ -52,12 +66,20 @@ def main(argv=None):
         if s.mode == "landscape":
             res = pr.align(prog)
             print(f"\nAligned {sum(r.ok for r in res)}/{len(res)} frames")
+            for r in res:
+                if r.ok and not r.enabled:
+                    print(f"  frame {r.index + 1}: {r.message}")
         pr.stack(prog)
-        fp = FinishParams(linear_output=a.linear)
+        fp = FinishParams(linear_output=a.linear, enhance_stars=a.enhance_stars,
+                          remove_gradient=a.remove_gradient)
+        if a.astro_stretch is not None:
+            fp.tone, fp.asinh_strength = "asinh", a.astro_stretch
         fp.exposure = a.exposure if a.exposure is not None else pr.suggest_exposure(fp.black_point)
         files = pr.export(a.output, fp, bits=32 if a.output.lower().endswith((".fit", ".fits")) else 16,
                           layers=a.layers, progress=prog)
-        print(f"\nSaved {', '.join(files)} in {time.time() - t0:.0f}s")
+        if a.timelapse:
+            files += pr.export_frames(a.timelapse, fp, progress=prog)
+        print(f"\nSaved {len(files)} file(s), e.g. {files[0]}, in {time.time() - t0:.0f}s")
     finally:
         pr.cleanup()
 

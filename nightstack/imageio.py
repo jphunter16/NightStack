@@ -43,15 +43,57 @@ def to_gray(img: np.ndarray) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------------- loading
-def load_image(path: str, half_size: bool = False) -> np.ndarray:
-    """Load any supported image as linear float32 RGB (H, W, 3)."""
+DEMOSAIC = {
+    "AHD": "AHD (balanced, default)",
+    "DCB": "DCB (sharp, low artifacts)",
+    "DHT": "DHT (fine detail)",
+    "AAHD": "AAHD (smooth gradients)",
+    "VNG": "VNG (low noise)",
+    "PPG": "PPG (fast)",
+    "LINEAR": "Bilinear (fastest)",
+}
+
+
+def _raw_params(rawpy, half_size, demosaic):
+    kw = dict(gamma=(1, 1), no_auto_bright=True, output_bps=16, use_camera_wb=True, half_size=half_size,
+              output_color=rawpy.ColorSpace.sRGB)
+    if demosaic and not half_size:
+        try:
+            alg = rawpy.DemosaicAlgorithm[demosaic]
+            if alg.isSupported:
+                kw["demosaic_algorithm"] = alg
+        except (KeyError, AttributeError):
+            pass
+    return kw
+
+
+def load_cfa(path: str):
+    """Raw sensor (Bayer/CFA) data, black-subtracted float32, plus its colour index map."""
+    import rawpy
+    with rawpy.imread(path) as raw:
+        cfa = raw.raw_image_visible.astype(np.float32)
+        black = float(np.mean(raw.black_level_per_channel))
+        colors = raw.raw_colors_visible.copy()
+        white = float(raw.white_level)
+    return cfa - black, colors, black, white
+
+
+def load_image(path: str, half_size: bool = False, demosaic: str = "AHD", cfa_calibrate=None) -> np.ndarray:
+    """Load any supported image as linear float32 RGB (H, W, 3).
+
+    cfa_calibrate(cfa, colors) -> cfa: optional function applied to the black-subtracted raw sensor
+    data *before* demosaicing (Siril-style calibration: darks / flats on the Bayer data).
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext in RAW_EXTS:
         import rawpy
         with rawpy.imread(path) as raw:
-            rgb = raw.postprocess(gamma=(1, 1), no_auto_bright=True, output_bps=16,
-                                  use_camera_wb=True, half_size=half_size,
-                                  output_color=rawpy.ColorSpace.sRGB)
+            if cfa_calibrate is not None:
+                black = float(np.mean(raw.black_level_per_channel))
+                cfa = raw.raw_image_visible.astype(np.float32) - black
+                cfa = cfa_calibrate(cfa, raw.raw_colors_visible)
+                raw.raw_image_visible[:] = np.clip(cfa + black, 0, raw.white_level).astype(np.uint16)
+            rgb = raw.postprocess(**_raw_params(rawpy, half_size, demosaic))
         img = rgb.astype(np.float32) / 65535.0
     elif ext in FITS_EXTS:
         from astropy.io import fits

@@ -50,13 +50,75 @@ def build_master(paths: Sequence[str], cache_dir: str, name: str, half_size: boo
                 img = img - subtract
             cache.write(i, img)
         progress(p0 + (p1 - p0) * 0.85, f"Combining master {name}")
-        out = np.empty((h, w, 3), np.float32)
-        step = 128
-        for r in range(0, h, step):
-            out[r:r + step] = np.median(cache.rows(r, min(h, r + step)), axis=0)
-        return out
+        return _combine_cache(cache, h, w, 3)
     finally:
         cache.close()
+
+
+def _combine_cache(cache, h, w, ch):
+    """Sigma-clipped (5+ frames) or median master, computed in strips."""
+    from .stack import combine
+    method = "sigma" if cache.n >= 5 else "median"
+    out = np.empty((h, w, ch) if ch > 1 else (h, w), np.float32)
+    step = 64
+    for r in range(0, h, step):
+        d = cache.rows(r, min(h, r + step))
+        if ch == 1:
+            d = d[..., None]
+        res, _ = combine(d, None, method, kappa=3.0)
+        out[r:r + step] = res if ch > 1 else res[..., 0]
+    return out
+
+
+def build_master_cfa(paths: Sequence[str], cache_dir: str, name: str, subtract: Optional[np.ndarray] = None,
+                     progress: Progress = _noop, p0: float = 0.0, p1: float = 1.0) -> Optional[np.ndarray]:
+    """Master frame on raw sensor (Bayer) data, black-level subtracted."""
+    from .imageio import load_cfa
+    paths = list(paths)
+    if not paths:
+        return None
+    first, _, _, _ = load_cfa(paths[0])
+    h, w = first.shape
+    if len(paths) == 1:
+        return first - subtract if subtract is not None else first
+    cache = FrameCache(cache_dir, f"master-cfa-{name}", len(paths), h, w, channels=1, dtype=np.float32)
+    try:
+        for i, p in enumerate(paths):
+            progress(p0 + (p1 - p0) * 0.8 * i / len(paths), f"Reading {name} frame {i + 1}/{len(paths)}")
+            cfa = first if i == 0 else load_cfa(p)[0]
+            if cfa.shape != first.shape:
+                raise ValueError(f"{name} frame {p} has a different size than the others")
+            cache.write(i, cfa - subtract if subtract is not None else cfa)
+        progress(p0 + (p1 - p0) * 0.85, f"Combining master {name}")
+        return _combine_cache(cache, h, w, 1)
+    finally:
+        cache.close()
+
+
+def normalise_flat_cfa(flat: np.ndarray, colors: np.ndarray) -> np.ndarray:
+    """Normalise a Bayer flat per colour channel (keeps the sensor's colour balance)."""
+    f = flat.astype(np.float32).copy()
+    for c in np.unique(colors):
+        sel = colors == c
+        f[sel] /= max(float(np.median(f[sel])), 1e-6)
+    return np.clip(f, 0.05, None)
+
+
+class CFACalibrator:
+    """Applies master bias/dark/flat to raw Bayer data before demosaicing."""
+
+    def __init__(self, bias=None, dark=None, flat_norm=None):
+        self.bias, self.dark, self.flat = bias, dark, flat_norm
+
+    def __call__(self, cfa: np.ndarray, colors=None) -> np.ndarray:
+        out = cfa
+        if self.dark is not None:
+            out = out - self.dark
+        elif self.bias is not None:
+            out = out - self.bias
+        if self.flat is not None:
+            out = out / self.flat
+        return out
 
 
 def normalise_flat(flat: np.ndarray) -> np.ndarray:

@@ -1,4 +1,4 @@
-"""Pixel combination (mean / median / sigma-clip / max) and sky-ground blending."""
+"""Pixel combination with Siril-style rejection, normalization weights, and sky/ground blending."""
 from __future__ import annotations
 
 from typing import Optional
@@ -9,47 +9,49 @@ import numpy as np
 from .calibration import fast_nanmedian
 
 SKY_METHODS = {
-    "sigma": "Sigma-clipped mean  (best - removes planes & satellites)",
+    "sigma": "Sigma-clipped mean  (best all-round, removes planes)",
+    "winsor": "Winsorized sigma  (great for 15+ frames)",
+    "linear": "Linear-fit clipping  (best when sky brightness drifts)",
+    "mad": "MAD clipping  (very robust, few frames)",
+    "percentile": "Percentile clipping  (for 3-6 frames)",
     "median": "Median  (robust, slightly noisier)",
     "mean": "Mean  (lowest noise, keeps planes)",
-    "winsor": "Winsorized sigma mean  (great for 15+ frames)",
     "max": "Maximum  (lighten)",
 }
 GROUND_METHODS = {
     "median": "Median  (removes moving cars / people)",
     "sigma": "Sigma-clipped mean",
+    "winsor": "Winsorized sigma",
     "mean": "Mean  (lowest noise)",
 }
 BLEND_MODES = {
     "min_noise": "Minimum horizon noise  (recommended)",
     "standard": "Standard feathered edge",
 }
+CLIP_METHODS = ("sigma", "winsor", "linear", "mad", "percentile")
 
 
 def combine(data: np.ndarray, valid: Optional[np.ndarray], method: str, kappa: float = 2.5,
-            iterations: int = 3):
-    """data: (N, h, w, 3) float32, valid: (N, h, w) bool or None. Returns (image, count)."""
+            iterations: int = 3, weights: Optional[np.ndarray] = None):
+    """data (N, h, w, 3) float32; valid (N, h, w) bool or None; weights (N,) per-frame or None.
+
+    Returns (image, count of contributing frames per pixel).
+    """
     n = data.shape[0]
     if valid is None:
         valid = np.ones(data.shape[:3], bool)
     v = valid[..., None]
     count = valid.sum(0).astype(np.float32)
+    w = np.ones(n, np.float32) if weights is None else np.asarray(weights, np.float32)
     if method == "max":
         out = np.where(v, data, -np.inf).max(0)
-    elif method == "mean" or (method in ("sigma", "winsor") and n < 4):
-        out = (data * v).sum(0) / np.maximum(count, 1)[..., None]
     elif method == "median":
         out = fast_nanmedian(np.where(v, data, np.nan), 0)
-    elif method == "sigma":
-        out = _sigma_clip_sorted(np.where(v, data, np.nan), kappa, iterations)
-    elif method == "winsor":
-        d = np.where(v, data, np.nan)
-        for _ in range(iterations):
-            med = fast_nanmedian(d, 0)
-            std = _nanstd(d)
-            d = np.where(np.isnan(d), np.nan, np.clip(d, med - kappa * std, med + kappa * std))
-        cnt = np.sum(~np.isnan(d), 0)
-        out = np.nansum(d, 0) / np.maximum(cnt, 1)
+    elif method == "mean" or (method in CLIP_METHODS and n < 3):
+        wv = v * w[:, None, None, None]
+        out = (data * wv).sum(0) / np.maximum(wv.sum(0), 1e-12)
+    elif method in CLIP_METHODS:
+        out = clip_sorted(data, v, w, method, kappa, iterations)
     else:
         raise ValueError(method)
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -65,39 +67,98 @@ def _gather(arr: np.ndarray, idx: np.ndarray) -> np.ndarray:
     return np.take(arr.reshape(n * p), flat).reshape(idx.shape)
 
 
-def _sigma_clip_sorted(d: np.ndarray, kappa: float, iterations: int) -> np.ndarray:
-    """Kappa-sigma clipped mean with a single sort.
+def _window(keep: np.ndarray, lo: np.ndarray, hi: np.ndarray):
+    """Shrink [lo, hi) to the first..last kept sample (rejection happens at the sorted ends)."""
+    n = keep.shape[0]
+    j = np.arange(n).reshape((n,) + (1,) * (keep.ndim - 1))
+    inside = keep & (j >= lo[None]) & (j < hi[None])
+    any_ = inside.any(0)
+    first = np.argmax(inside, 0)
+    last = n - np.argmax(inside[::-1], 0)
+    return np.where(any_, first, lo), np.where(any_, last, hi)
 
-    Clipping only ever removes values from the two ends of the sorted samples, so each
-    pixel keeps a [lo, hi) window into its sorted array; median and std of the window
-    come from index lookups and cumulative sums - no re-sorting per iteration.
+
+def clip_sorted(data, v, w, method: str, kappa: float, iterations: int) -> np.ndarray:
+    """Rejection stacking with a single (arg)sort.
+
+    Every algorithm rejects only from the low or high end of a pixel's sorted samples, so
+    each pixel keeps a window [lo, hi) into its sorted values.  Means / variances of the
+    window come from cumulative sums; the weighted mean of the survivors is the result.
+    Methods follow Siril: sigma, winsorized sigma, linear-fit, MAD and percentile clipping.
     """
-    srt = np.sort(d, axis=0)                      # NaN (invalid) go to the end
+    d = np.where(v, data, np.nan)
+    order = np.argsort(d, axis=0)                 # NaN (invalid samples) sort to the end
+    srt = np.take_along_axis(d, order, 0)
     n_valid = np.sum(~np.isnan(srt), 0)
     z = np.nan_to_num(srt)
+    N = z.shape[0]
+    ws = np.broadcast_to(w[:, None, None, None], d.shape)
+    ws = np.take_along_axis(ws, order, 0) * (~np.isnan(srt))
     zero = np.zeros((1,) + z.shape[1:], np.float32)
     cs = np.concatenate([zero, np.cumsum(z, 0, dtype=np.float32)], 0)
     cs2 = np.concatenate([zero, np.cumsum(z * z, 0, dtype=np.float32)], 0)
     lo = np.zeros(n_valid.shape, np.int64)
     hi = n_valid.astype(np.int64)
     filled = np.where(np.isnan(srt), np.inf, srt)
+    jidx = np.arange(N, dtype=np.float32).reshape((N,) + (1,) * (z.ndim - 1))
+    if method == "linear":
+        csj = np.concatenate([zero, np.cumsum(z * jidx, 0, dtype=np.float32)], 0)
+    if method == "winsor":
+        zw = z.copy()
     for _ in range(iterations):
-        cnt = np.maximum(hi - lo, 1)
-        m1 = (_gather(cs, hi) - _gather(cs, lo)) / cnt
-        m2 = (_gather(cs2, hi) - _gather(cs2, lo)) / cnt
-        std = np.sqrt(np.clip(m2 - m1 ** 2, 0, None) * cnt / np.maximum(cnt - 1, 1))
-        a = np.clip((lo + hi - 1) // 2, 0, srt.shape[0] - 1)
-        b = np.clip((lo + hi) // 2, 0, srt.shape[0] - 1)
+        cnt = np.maximum(hi - lo, 1).astype(np.float32)
+        a = np.clip((lo + hi - 1) // 2, 0, N - 1)
+        b = np.clip((lo + hi) // 2, 0, N - 1)
         med = 0.5 * (_gather(z, a) + _gather(z, b))
-        new_lo = np.sum(filled < (med - kappa * std)[None], 0)
-        new_hi = np.sum(filled <= (med + kappa * std)[None], 0)
-        new_lo = np.maximum(new_lo, lo)
-        new_hi = np.minimum(new_hi, hi)
-        ok = new_hi - new_lo >= np.minimum(3, n_valid)  # never clip away everything
+        if method in ("sigma", "winsor"):
+            src_cs, src_cs2 = cs, cs2
+            if method == "winsor":
+                zc = np.concatenate([zero, np.cumsum(zw, 0, dtype=np.float32)], 0)
+                zc2 = np.concatenate([zero, np.cumsum(zw * zw, 0, dtype=np.float32)], 0)
+                src_cs, src_cs2 = zc, zc2
+            m1 = (_gather(src_cs, hi) - _gather(src_cs, lo)) / cnt
+            m2 = (_gather(src_cs2, hi) - _gather(src_cs2, lo)) / cnt
+            std = np.sqrt(np.clip(m2 - m1 ** 2, 0, None) * cnt / np.maximum(cnt - 1, 1))
+            if method == "winsor":
+                std = std * 1.134  # Huber correction used by Siril / PixInsight
+                zw = np.clip(z, (med - 1.5 * std)[None], (med + 1.5 * std)[None])
+            keep = (filled >= (med - kappa * std)[None]) & (filled <= (med + kappa * std)[None])
+        elif method == "mad":
+            j = np.arange(N).reshape((N,) + (1,) * (z.ndim - 1))
+            inwin = (j >= lo[None]) & (j < hi[None])
+            dev = np.where(inwin, np.abs(z - med[None]), np.nan)
+            mad = 1.4826 * fast_nanmedian(dev, 0)
+            keep = np.abs(filled - med[None]) <= kappa * mad[None]
+        elif method == "percentile":
+            p = 0.25 * kappa / 2.5   # +/-25% around the median at the default strength
+            keep = (filled >= (med * (1 - p))[None]) & (filled <= (med * (1 + p))[None])
+        elif method == "linear":
+            # Fit sorted values against their rank; reject samples far from the line.
+            S0 = cnt
+            Sj = ((hi - 1) * hi / 2 - (lo - 1) * lo / 2).astype(np.float32)
+            Sjj = (((hi - 1) * hi * (2 * hi - 1) - (lo - 1) * lo * (2 * lo - 1)) / 6).astype(np.float32)
+            Sy = _gather(cs, hi) - _gather(cs, lo)
+            Sjy = _gather(csj, hi) - _gather(csj, lo)
+            den = S0 * Sjj - Sj * Sj
+            slope = np.where(np.abs(den) > 1e-9, (S0 * Sjy - Sj * Sy) / np.where(den == 0, 1, den), 0)
+            icpt = (Sy - slope * Sj) / S0
+            res = filled - (icpt[None] + slope[None] * jidx)
+            j = np.arange(N).reshape((N,) + (1,) * (z.ndim - 1))
+            inwin = (j >= lo[None]) & (j < hi[None]) & np.isfinite(filled)
+            # Siril uses the mean absolute deviation from the fit (robust to the outliers being fitted)
+            sig = np.where(inwin, np.abs(res), 0).sum(0) / np.maximum(cnt, 1) * 1.2533
+            keep = np.abs(res) <= kappa * sig[None]
+        else:
+            raise ValueError(method)
+        keep &= np.isfinite(filled)
+        new_lo, new_hi = _window(keep, lo, hi)
+        ok = (new_hi - new_lo) >= np.minimum(3, n_valid)  # never reject everything
         lo = np.where(ok, new_lo, lo)
         hi = np.where(ok, new_hi, hi)
-    cnt = np.maximum(hi - lo, 1)
-    out = (_gather(cs, hi) - _gather(cs, lo)) / cnt
+    wz = ws * (zw if method == "winsor" else z)
+    cw = np.concatenate([zero, np.cumsum(ws, 0, dtype=np.float32)], 0)
+    cwz = np.concatenate([zero, np.cumsum(wz, 0, dtype=np.float32)], 0)
+    out = (_gather(cwz, hi) - _gather(cwz, lo)) / np.maximum(_gather(cw, hi) - _gather(cw, lo), 1e-12)
     return out.astype(np.float32)
 
 

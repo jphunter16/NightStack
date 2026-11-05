@@ -22,6 +22,9 @@ class FinishParams:
     ground_denoise: float = 0.0    # 0..1
     protect_highlights: bool = True
     linear_output: bool = False
+    enhance_stars: float = 0.0     # 0..1  (Sequator "Enhance star light")
+    tone: str = "natural"          # natural | asinh (colour-preserving astro stretch, Siril-style)
+    asinh_strength: float = 30.0
 
     def to_dict(self):
         return asdict(self)
@@ -103,11 +106,32 @@ def apply_finish(img: np.ndarray, mask: np.ndarray, p: FinishParams, display: bo
             dn = cv2.bilateralFilter(out, 7, noise * 8 * p.ground_denoise, 2 + 2 * p.ground_denoise)
             g = (1 - m) * p.ground_denoise
             out = out * (1 - g) + dn * g
+    if p.enhance_stars > 0:
+        # Boost point sources only (median background keeps nebulae / Milky Way / ground untouched).
+        g = out.astype(np.float32)
+        bgp = cv2.medianBlur(cv2.medianBlur(g, 5), 5)
+        stars = np.clip(g - bgp, 0, None)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        stars = cv2.GaussianBlur(cv2.dilate(stars, k), (0, 0), 0.6) * 0.5 + stars * 0.5
+        out = out + m * stars * (2.0 * p.enhance_stars)
     if p.linear_output and not display:
         return np.clip(out, 0, 1)
     bg = _bg_stats(out, mask).mean()
     out = np.clip(out - p.black_point * bg, 0, None)
     out *= 2.0 ** p.exposure
+    if p.tone == "asinh":
+        # Colour-preserving arcsinh stretch: lifts faint sky while keeping star colour (Siril / Lupton).
+        lum = to_gray(out)[..., None]
+        b = max(p.asinh_strength, 1e-3)
+        scale = np.arcsinh(b * lum) / (np.arcsinh(b) * np.maximum(lum, 1e-7))
+        s = np.clip(out * scale, 0, None)
+        s = s / np.maximum(1.0, s.max(-1, keepdims=True))  # keep hue when a channel saturates
+        if p.contrast != 0:
+            s = np.clip((s - 0.5) * (1 + p.contrast) + 0.5, 0, 1)
+        if p.saturation != 1:
+            lm = to_gray(s)[..., None]
+            s = np.clip(lm + (s - lm) * p.saturation, 0, 1)
+        return s.astype(np.float32)
     if p.protect_highlights:
         knee = 0.6  # soft shoulder: bright stars & lights roll off instead of clipping hard
         over = np.clip(out - knee, 0, None)
