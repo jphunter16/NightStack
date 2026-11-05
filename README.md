@@ -17,6 +17,22 @@ Stacker, with Siril-style calibration and stacking under the hood.
 | **5 Stack** | Sky from the aligned frames, foreground from the originals. Methods: **sigma-clipped mean** (removes planes & satellites), **median**, mean, winsorized, max. Blending: **Minimum Horizon Noise** or standard feathered edge. **Star-trail** (lighten) mode too. |
 | **6 Finish & Save** | Brightness/black point/contrast/saturation, **light-pollution gradient removal**, sky colour neutralisation, extra sky/foreground smoothing, highlight protection. Save **16-bit TIFF**, JPEG, PNG, 32-bit TIFF or **FITS**, optionally **linear** data and separate sky / foreground / mask layers for Photoshop. |
 
+### Techniques borrowed from the best
+| From | Technique | In NightStack |
+|---|---|---|
+| **Siril** | Calibration on raw Bayer data *before* demosaicing | Automatic when lights + darks/flats/bias are all RAW |
+| **Siril** | Sigma-rejected master darks/flats/bias | Masters use sigma clipping (5+ frames) |
+| **Siril** | Rejection algorithms | Sigma, winsorized sigma, linear-fit, MAD, percentile clipping, plus median/mean/max |
+| **Siril** | Frame normalisation (additive + scaling) | Matches each frame's sky level & spread to the reference |
+| **Siril** | Frame weighting & selection by FWHM / roundness / background | Per-frame quality table; auto-skips blurry, bumped, cloudy or bright frames |
+| **Siril** | Background extraction, asinh stretch | Gradient removal (4 complexity levels); colour-preserving asinh tone curve |
+| **Starry Landscape Stacker** | Auto sky detection + editable alignment dots / horizon | Red dots, eraser, sky brush, green horizon points, undo |
+| **Starry Landscape Stacker** | Dense local alignment for wide-angle lenses | Homography + smooth lens-distortion field |
+| **Starry Landscape Stacker** | Minimum-horizon-noise stacking | Validity-tracked sky + all-frames fill near the horizon |
+| **Sequator** | Freeze ground / separate foreground exposures (HDR blend) | Optional foreground photos, brightness-matched to the night frames |
+| **Sequator** | Enhance star light, reduce light pollution | "Enhance stars" slider; gradient removal |
+| **Sequator** | Time-lapse output, speed | Export all aligned frames; multi-core stacking |
+
 ### Minimum Horizon Noise, explained
 After aligning, the sky just above the horizon is covered by ground in *some* frames (the ground
 doesn't rotate with the stars), so fewer frames contribute there and that band ends up noisier. NightStack:
@@ -54,6 +70,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```bash
 python -m nightstack ~/Pictures/MilkyWay/*.CR2 -o milkyway.tif --darks darks/*.CR2 --layers
 python -m nightstack frames/*.NEF --trails -o trails.jpg
+python -m nightstack night/*.ARW --foreground bluehour.ARW --sky linear --enhance-stars 0.4 -o final.tif
 ```
 
 ## Tips for great results
