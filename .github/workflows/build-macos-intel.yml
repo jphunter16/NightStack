@@ -1,0 +1,20 @@
+# Builds NightStack.app on GitHub's Intel macOS runner and attaches the .dmg as a downloadable artifact.
+name: Build macOS (Intel)
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: ./build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NightStack-macOS-Intel
+          path: dist/NightStack.dmg

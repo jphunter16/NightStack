@@ -1,0 +1,8 @@
+# NightStack runtime dependencies (Intel / x86_64 macOS 11+ wheels exist for all of these)
+numpy>=1.26
+opencv-python-headless>=4.9   # headless build: avoids clashing with PySide6's own Qt
+PySide6-Essentials>=6.6
+scipy>=1.11
+rawpy>=0.19                   # LibRaw: CR2/CR3/NEF/ARW/RAF/ORF/RW2/DNG...
+tifffile>=2023.7
+astropy>=5.3                  # FITS read/write (Siril / PixInsight interchange)

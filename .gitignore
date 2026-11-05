@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+.venv-build/
+build/
+dist/
+*.dat
+.DS_Store
+NightStack-source.zip
