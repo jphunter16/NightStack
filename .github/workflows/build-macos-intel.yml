@@ -1,9 +1,16 @@
-# Builds NightStack.app on GitHub's Intel macOS runner and attaches the .dmg as a downloadable artifact.
+# Builds NightStack.app on GitHub's Intel Mac.  When the version in nightstack/__init__.py is new,
+# it also publishes a GitHub Release - that's what the app's built-in updater downloads.
 name: Build macOS (Intel)
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+permissions:
+  contents: write
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: macos-15-intel
@@ -14,7 +21,23 @@ jobs:
           python-version: "3.12"
       - name: Build
         run: ./build_mac.sh
+      - name: Zip app for the in-app updater
+        run: ditto -c -k --keepParent dist/NightStack.app dist/NightStack-macOS-Intel.zip
       - uses: actions/upload-artifact@v4
         with:
           name: NightStack-macOS-Intel
-          path: dist/NightStack.dmg
+          path: |
+            dist/NightStack.dmg
+            dist/NightStack-macOS-Intel.zip
+      - name: Publish release (only when the version is new)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(python3 -c "import re;print(re.search(r'__version__ = \"(.+?)\"', open('nightstack/__init__.py').read()).group(1))")
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists - nothing to publish."
+          else
+            git log -1 --pretty=%B > notes.md
+            gh release create "v$VERSION" dist/NightStack.dmg dist/NightStack-macOS-Intel.zip \
+              --title "NightStack $VERSION" --notes-file notes.md
+          fi

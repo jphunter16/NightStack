@@ -25,6 +25,8 @@ app.setStyle("Fusion")
 app.setPalette(dark_palette())
 app.setStyleSheet(STYLE)
 QMessageBox.exec = lambda self: 0  # never block on dialogs
+from PySide6.QtCore import QSettings
+QSettings("NightStack", "NightStack").clear()   # start from factory settings
 w = MainWindow()
 w.resize(1500, 920)
 w.show()
@@ -79,11 +81,26 @@ w.undo()
 w.set_tool(Tool.HORIZON)
 shot("3b_sky_horizon_tool.png")
 w.steps.setCurrentRow(3)
+QTest.qWait(300)
+assert not w.project.aligned_ok and w.worker is None, "alignment should not start by itself"
+w.align()
 wait()
 assert w.project.aligned_ok
 w.align_table.selectRow(2)
 shot("4_align.png")
 w.steps.setCurrentRow(4)
+QTest.qWait(300)
+assert not w.project.stacked and w.worker is None, "stacking should not start by itself"
+# Cancel must stop quickly
+import time as _t
+w.do_stack()
+QTest.qWait(400)
+t0 = _t.time()
+w.cancel_task()
+wait()
+print(f"cancel took {_t.time() - t0:.2f}s, stacked={w.project.stacked}")
+assert not w.project.stacked
+w.do_stack()
 wait()
 assert w.project.stacked
 shot("5_stack.png")
@@ -106,6 +123,54 @@ shot("6_finish.png")
 w.tone.setCurrentIndex(1)
 QTest.qWait(400)
 shot("6b_finish_asinh.png")
+# typed slider values
+w.exposure.spin.setValue(0.5)
+assert abs(w.exposure.value() - 0.5) < 1e-9, w.exposure.value()
+w.exposure.spin.setValue(0.53)                     # not on a slider step: kept exactly
+assert abs(w.exposure.value() - 0.53) < 1e-9
+w.black.spin.setValue(12)                          # percent box
+assert abs(w.black.value() - 0.12) < 1e-9
+# baseline reset
+w.reset_finish()
+fp = w.finish_params()
+assert (fp.exposure, fp.black_point, fp.contrast, fp.saturation, fp.neutralize, fp.remove_gradient,
+        fp.protect_highlights, fp.enhance_stars, fp.tone) == (0, 0, 0, 1, False, False, False, 0, "natural"), fp
+QTest.qWait(400)
+shot("6c_finish_baseline.png")
+# full-resolution 100% preview
+w.render_full_preview()
+wait()
+assert w.full_preview and w.viewer.image_rect().width() == w.project.shape[1]
+shot("6d_full_100.png")
+w.saturation.set(1.1)                              # slider move -> back to fast preview
+QTest.qWait(500)
+assert not w.full_preview and w.viewer.image_rect().width() < w.project.shape[1]
+print("typed values, baseline reset and 100% preview OK")
+# hover descriptions + preferences
+assert "stops" in w.exposure.toolTip() and w.exposure.spin.toolTip()
+from nightstack.gui.preferences import PreferencesDialog
+dlg = PreferencesDialog(w)
+dlg.general["tooltips"].setChecked(False)
+dlg.editors["sky_method"].setCurrentIndex(w.sky_method.findData("median"))
+dlg.accept()
+assert w.tooltip_filter.enabled is False and w.sky_method.currentData() == "median"
+assert QSettings("NightStack", "NightStack").value("pref/sky_method") is not None
+dlg2 = PreferencesDialog(w)
+dlg2.resize(700, 560)
+dlg2.show()
+QTest.qWait(200)
+dlg2.findChild(type(dlg2.table).__mro__[0]).parent()
+from PySide6.QtWidgets import QTabWidget
+tabs = dlg2.findChild(QTabWidget)
+for i, name in enumerate(["7a_prefs_general", "7b_prefs_defaults", "7c_prefs_saving", "7d_prefs_all", "7e_prefs_storage"]):
+    tabs.setCurrentIndex(i)
+    QTest.qWait(150)
+    dlg2.grab().save(os.path.join(out, name + ".png"))
+dlg2.restore_defaults()
+dlg2.accept()
+assert w.tooltip_filter.enabled is True and w.sky_method.currentData() == "sigma"
+print("preferences OK")
+print("method notes:", w.project.method_notes)
 fr = w.project.export_frames(os.path.join(out, "timelapse"), w.finish_params())
 assert len(fr) == len(files)
 path = os.path.join(out, "gui_export.tif")

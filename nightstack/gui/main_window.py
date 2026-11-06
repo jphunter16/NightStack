@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Callable, Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QThreadPool, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QDoubleSpinBox, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout,
                                QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget,
                                QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
                                QRadioButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter,
@@ -49,36 +50,70 @@ def primary(text):
 
 
 class LabeledSlider(QWidget):
-    """Slider with a live value label; maps an int slider to a float range."""
+    """Slider plus a box you can type an exact value into.
+
+    `fmt` describes how the value is shown, e.g. "{:+.2f} EV", "{:.0%}", "{:.0f}px".
+    The value is kept as a float, so typed values aren't rounded to the slider's steps.
+    """
+    changed = Signal(float)
 
     def __init__(self, lo, hi, value, step=0.01, fmt="{:.2f}", parent=None):
         super().__init__(parent)
-        self.lo, self.step, self.fmt = lo, step, fmt
+        self.lo, self.hi, self.step, self.fmt = lo, hi, step, fmt
+        m = re.match(r"\{:(\+?)\.(\d)([f%])\}(.*)", fmt)
+        plus, dec, kind, suffix = (m.group(1), int(m.group(2)), m.group(3), m.group(4)) if m else ("", 2, "f", "")
+        self.scale = 100.0 if kind == "%" else 1.0
+        if kind == "%":
+            suffix = "%" + suffix
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, int(round((hi - lo) / step)))
-        self.label = QLabel()
-        self.label.setMinimumWidth(44)
-        self.label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.slider.setMinimumHeight(22)
+        self.spin = QDoubleSpinBox()
+        self.spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.spin.setKeyboardTracking(False)          # apply on Return / leaving the box
+        self.spin.setDecimals(dec)
+        self.spin.setRange(lo * self.scale, hi * self.scale)
+        self.spin.setSingleStep(step * self.scale)    # arrow keys / scroll still nudge
+        self.spin.setSuffix(suffix)
+        if plus:
+            self.spin.setPrefix("")
+        self.spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.spin.setFixedWidth(84 if len(suffix) > 2 else 70)
+        self.spin.setFixedHeight(26)
+        self.spin.setToolTip("Type a value and press Return")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
         lay.addWidget(self.slider, 1)
-        lay.addWidget(self.label)
-        self.slider.valueChanged.connect(self._upd)
-        self.set(value)
+        lay.addWidget(self.spin)
+        self._v = float(value)
+        self.slider.valueChanged.connect(self._from_slider)
+        self.spin.valueChanged.connect(self._from_spin)
+        self._sync()
 
-    def _upd(self):
-        self.label.setText(self.fmt.format(self.value()))
+    def _sync(self):
+        for w, v in ((self.slider, int(round((self._v - self.lo) / self.step))), (self.spin, self._v * self.scale)):
+            w.blockSignals(True)
+            w.setValue(v)
+            w.blockSignals(False)
+
+    def _from_slider(self, pos):
+        self._v = self.lo + pos * self.step
+        self._sync()
+        self.changed.emit(self._v)
+
+    def _from_spin(self, shown):
+        self._v = float(np.clip(shown / self.scale, self.lo, self.hi))
+        self._sync()
+        self.changed.emit(self._v)
 
     def value(self):
-        return self.lo + self.slider.value() * self.step
+        return self._v
 
     def set(self, v):
-        self.slider.setValue(int(round((v - self.lo) / self.step)))
-        self._upd()
-
-    @property
-    def changed(self):
-        return self.slider.valueChanged
+        self._v = float(np.clip(v, self.lo, self.hi))
+        self._sync()
+        self.changed.emit(self._v)
 
 
 def combo(options: dict, current: str) -> QComboBox:
@@ -96,6 +131,19 @@ def shrink(c: QComboBox) -> QComboBox:
     c.setMinimumContentsLength(12)
     c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     return c
+
+
+class TooltipFilter(QObject):
+    """Hides hover descriptions app-wide when they're turned off in Preferences."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.enabled = True
+
+    def eventFilter(self, obj, ev):
+        if not self.enabled and ev.type() == QEvent.ToolTip:
+            return True
+        return False
 
 
 # --------------------------------------------------------------------------- main window
@@ -138,8 +186,12 @@ class MainWindow(QMainWindow):
         self.steps.currentRowChanged.connect(self.go_step)
         sl.addWidget(self.steps, 1)
         self.info = hint("")
-        self.info.setContentsMargins(12, 0, 8, 12)
+        self.info.setContentsMargins(12, 0, 8, 6)
         sl.addWidget(self.info)
+        gear = QPushButton("⚙  Preferences")
+        gear.setToolTip("App settings, your default processing options, and a list of every setting (⌘,)")
+        gear.clicked.connect(self.open_preferences)
+        sl.addWidget(gear)
         root.addWidget(side)
 
         # Viewer ---------------------------------------------------------------
@@ -170,23 +222,16 @@ class MainWindow(QMainWindow):
         # Panels ----------------------------------------------------------------
         panel = QFrame()
         panel.setObjectName("Panel")
-        panel.setFixedWidth(370)
+        panel.setFixedWidth(396)
         pl = QVBoxLayout(panel)
         pl.setContentsMargins(0, 0, 0, 0)
         self.stack = QStackedWidget()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(self.stack)
-        pl.addWidget(scroll)
+        pl.addWidget(self.stack)
         root.addWidget(panel)
 
-        self.stack.addWidget(self._build_photos())
-        self.stack.addWidget(self._build_calibration())
-        self.stack.addWidget(self._build_sky())
-        self.stack.addWidget(self._build_align())
-        self.stack.addWidget(self._build_stack())
-        self.stack.addWidget(self._build_finish())
+        for build in (self._build_photos, self._build_calibration, self._build_sky, self._build_align,
+                      self._build_stack, self._build_finish):
+            self.stack.addWidget(self._pin_footer(build()))
 
         # Status bar -------------------------------------------------------------
         self.progress = QProgressBar()
@@ -205,6 +250,46 @@ class MainWindow(QMainWindow):
         self.steps.setCurrentRow(0)
         self.refresh_steps()
         self.show_welcome()
+        self._update_worker = None
+        self.setup_help_and_prefs()
+        QTimer.singleShot(4000, self.auto_check_updates)
+
+    @staticmethod
+    def _pin_footer(page: QWidget) -> QWidget:
+        """Settings scroll; the page's last widget (its main button) stays pinned at the bottom."""
+        lay = page.layout()
+        n = lay.count()
+        stretches = [lay.stretch(i) for i in range(n)]
+        items = [lay.takeAt(0) for _ in range(n)]
+        content = QWidget()
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(16, 16, 16, 8)
+        def move(item, target, stretch=0):
+            # addWidget/addLayout re-parent the widgets; a bare addItem would leave them behind.
+            if item.widget() is not None:
+                target.addWidget(item.widget(), stretch)
+            elif item.layout() is not None:
+                target.addLayout(item.layout(), stretch)
+            else:
+                target.addItem(item)
+                target.setStretch(target.count() - 1, stretch)
+
+        for it, st in zip(items[:-1], stretches[:-1]):
+            move(it, cl, st)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setWidget(content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(sc, 1)
+        foot = QWidget()
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(16, 8, 16, 14)
+        move(items[-1], fl)
+        lay.addWidget(foot)
+        return page
 
     # ======================================================================= menu & shortcuts
     def _build_menu(self):
@@ -214,6 +299,9 @@ class MainWindow(QMainWindow):
         m.addAction(QAction("Save Image…", self, shortcut=QKeySequence.Save, triggered=self.export))
         m.addSeparator()
         m.addAction(QAction("Start Over", self, triggered=self.start_over))
+        prefs = QAction("Preferences…", self, shortcut=QKeySequence.Preferences, triggered=self.open_preferences)
+        prefs.setMenuRole(QAction.PreferencesRole)     # macOS: NightStack menu → Preferences… (⌘,)
+        m.addAction(prefs)
         e = self.menuBar().addMenu("&Edit")
         e.addAction(QAction("Undo Mask Edit", self, shortcut=QKeySequence.Undo, triggered=self.undo))
         v = self.menuBar().addMenu("&View")
@@ -224,6 +312,12 @@ class MainWindow(QMainWindow):
                             triggered=lambda: self.viewer.zoom_by(1 / 1.4)))
         h = self.menuBar().addMenu("&Help")
         h.addAction(QAction("Quick Guide", self, triggered=self.show_guide))
+        h.addSeparator()
+        h.addAction(QAction("Check for Updates…", self, triggered=lambda: self.check_updates(silent=False)))
+        self.auto_update_action = QAction("Check for Updates Automatically", self, checkable=True)
+        self.auto_update_action.setChecked(self.qsettings.value("auto_update", True, type=bool))
+        self.auto_update_action.toggled.connect(lambda on: self.qsettings.setValue("auto_update", on))
+        h.addAction(self.auto_update_action)
         h.addAction(QAction(f"About {APP_NAME}", self, triggered=self.about))
 
     def _shortcuts(self):
@@ -856,6 +950,9 @@ class MainWindow(QMainWindow):
                      ("fwhm", "Star sharpness"), ("none", "Equal")):
             self.weighting.addItem(t, k)
         f.addRow("Frame weights", shrink(self.weighting))
+        self.small_stack_cb = QCheckBox("Small-stack protection (<10 frames)")
+        self.small_stack_cb.setChecked(True)
+        f.addRow(self.small_stack_cb)
         self.match_fg = QCheckBox("Match foreground photos to night brightness")
         self.match_fg.setChecked(True)
         f.addRow(self.match_fg)
@@ -944,6 +1041,7 @@ class MainWindow(QMainWindow):
         s.horizon_margin = self.margin.value()
         s.ground_frame = self.ground_pick.currentData() if s.ground_method == "best" else None
         s.normalize = self.normalize.isChecked()
+        s.auto_small_stack = self.small_stack_cb.isChecked()
         s.match_foreground = self.match_fg.isChecked()
         if s.weighting != self.weighting.currentData() and self.project.align_results:
             s.weighting = self.weighting.currentData()
@@ -951,17 +1049,19 @@ class MainWindow(QMainWindow):
 
         def done(_):
             self.preview_src = None
-            fp = self.finish_params()
-            ev = self.project.suggest_exposure(fp.black_point)
-            self.exposure.set(ev)
+            self.full_preview = False
             self.show_what.setCurrentIndex(0)
             self.show_stack_view()
             self.refresh_steps()
             ch = self.project.ground_choice
             self.ground_info.setText(f"Foreground from: {ch[0]}" if ch else "")
             self.ground_info.setVisible(bool(ch))
+            notes = self.project.method_notes
+            self.ground_info.setText("\n".join(([f"Foreground from: {ch[0]}"] if ch else []) + notes))
+            self.ground_info.setVisible(bool(ch or notes))
             self.statusBar().showMessage("Stack complete! Fine-tune and save in step 6." +
-                                         (f"  Foreground: {ch[0]}" if ch else ""))
+                                         (f"  Foreground: {ch[0]}" if ch else "") +
+                                         (f"  ({notes[0]})" if notes else ""))
         self.run_task(lambda p: self.project.stack(p), done)
 
     def show_stack_view(self):
@@ -974,7 +1074,7 @@ class MainWindow(QMainWindow):
         fp.sky_denoise = fp.ground_denoise = 0
         m = cv2.resize(pr.final_mask, None, fx=1, fy=1)
         if what == "count":
-            c = resize_max(pr.count, 1600) / max(1, pr.n_sky)
+            c = resize_max(pr.count, self.preview_size()) / max(1, pr.n_sky)
             heat = cv2.applyColorMap((np.clip(c, 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
             self.viewer.set_image(cv2.cvtColor(heat, cv2.COLOR_BGR2RGB), keep_view=True)
             self.view_caption.setText(f"Frames contributing sky data (red = all {pr.n_sky}, blue = few). "
@@ -982,7 +1082,7 @@ class MainWindow(QMainWindow):
             return
         src = {"result": pr.result, "sky": pr.sky_stack, "ground": pr.ground_stack,
                "single": pr.orig.read(pr.ref_idx) if what == "single" else None}[what]
-        img = resize_max(src, 1600)
+        img = resize_max(src, self.preview_size())
         ms = cv2.resize(m, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
         self.viewer.set_image(apply_finish(img, ms, fp), keep_view=True)
         self.view_caption.setText(self.show_what.currentText())
@@ -997,17 +1097,17 @@ class MainWindow(QMainWindow):
                          "open it in Lightroom or Photoshop."))
         g = QGroupBox("Tone")
         f = QFormLayout(g)
-        self.exposure = LabeledSlider(-3, 10, 0, 0.05, "{:+.2f} EV")
+        self.exposure = LabeledSlider(-5, 10, 0, 0.05, "{:+.2f} EV")
         f.addRow("Brightness", self.exposure)
         auto = QPushButton("Auto")
         auto.clicked.connect(lambda: self.exposure.set(self.project.suggest_exposure(self.black.value())))
         f.addRow("", auto)
-        self.black = LabeledSlider(0, 1, 0.5, 0.02, "{:.0%}")
+        self.black = LabeledSlider(0, 1, 0.0, 0.01, "{:.0%}")
         self.black.setToolTip("How much of the sky's background glow to remove (darker, punchier sky)")
         f.addRow("Black point", self.black)
         self.contrast = LabeledSlider(-0.5, 0.8, 0.0, 0.02, "{:+.2f}")
         f.addRow("Contrast", self.contrast)
-        self.saturation = LabeledSlider(0, 2, 1.15, 0.05, "{:.2f}")
+        self.saturation = LabeledSlider(0, 2, 1.0, 0.01, "{:.2f}")
         f.addRow("Saturation", self.saturation)
         self.tone = QComboBox()
         self.tone.addItem("Natural (photographic)", "natural")
@@ -1022,10 +1122,8 @@ class MainWindow(QMainWindow):
         self.gradient = QCheckBox("Remove light-pollution gradient")
         f2.addRow(self.gradient)
         self.neutral = QCheckBox("Neutral sky colour (remove colour cast)")
-        self.neutral.setChecked(True)
         f2.addRow(self.neutral)
         self.highlights = QCheckBox("Protect bright stars && lights")
-        self.highlights.setChecked(True)
         f2.addRow(self.highlights)
         self.grad_deg = QComboBox()
         for d, t in ((1, "Simple (linear)"), (2, "Normal"), (3, "Complex"), (4, "Very complex")):
@@ -1042,11 +1140,11 @@ class MainWindow(QMainWindow):
         l.addWidget(g2)
         for wdg in (self.exposure, self.black, self.contrast, self.saturation, self.sky_dn, self.gnd_dn,
                     self.asinh, self.stars_boost):
-            wdg.changed.connect(self.finish_timer.start)
+            wdg.changed.connect(lambda *_: self.finish_timer.start())
         for c in (self.tone, self.grad_deg):
-            c.currentIndexChanged.connect(self.finish_timer.start)
+            c.currentIndexChanged.connect(lambda *_: self.finish_timer.start())
         for cb in (self.gradient, self.neutral, self.highlights):
-            cb.toggled.connect(self.finish_timer.start)
+            cb.toggled.connect(lambda *_: self.finish_timer.start())
         self.before_btn = QPushButton("Hold to compare with a single frame")
         self.before_btn.pressed.connect(self.show_before)
         self.before_btn.released.connect(self.update_finish_preview)
@@ -1067,6 +1165,17 @@ class MainWindow(QMainWindow):
         f3.addRow(self.layers)
         l.addWidget(g3)
         l.addStretch(1)
+        row = QVBoxLayout()
+        reset = QPushButton("Reset to baseline")
+        reset.setToolTip("No adjustments: the stacked image exactly as shot (best for Lightroom)")
+        reset.clicked.connect(self.reset_finish)
+        row.addWidget(reset)
+        self.full_btn = QPushButton("🔍  Render 100% full preview")
+        self.full_btn.setToolTip("Renders the full-resolution image so you can inspect stars at 1:1. "
+                                 "Moving a slider switches back to the fast preview.")
+        self.full_btn.clicked.connect(lambda: self.render_full_preview())
+        row.addWidget(self.full_btn)
+        l.addLayout(row)
         self.frames_btn = QPushButton("Export aligned frames for a time-lapse…")
         self.frames_btn.setToolTip("Saves every frame with the sky aligned and your finishing applied")
         self.frames_btn.clicked.connect(self.export_frames)
@@ -1086,6 +1195,7 @@ class MainWindow(QMainWindow):
                             tone=self.tone.currentData(), asinh_strength=self.asinh.value())
 
     def enter_finish(self):
+        self.full_preview = False
         self.viewer.edit_enabled = False
         self.viewer.set_tool(Tool.PAN)
         self.viewer.clear_overlays()
@@ -1095,14 +1205,74 @@ class MainWindow(QMainWindow):
     def update_finish_preview(self):
         if not self.project.stacked or self.stack.currentIndex() != 5:
             return
-        img, m = self.project.preview_inputs(1600)
-        self.viewer.set_image(apply_finish(img, m, self.finish_params()), keep_view=True)
-        self.view_caption.setText("Preview (final image is saved at full resolution)")
+        img, m = self.project.preview_inputs(self.preview_size())
+        out = apply_finish(img, m, self.finish_params())
+        if getattr(self, "full_preview", False):
+            self.full_preview = False
+            self.swap_image(out)
+            self.view_caption.setText("Fast preview - click “Render 100% full preview” to inspect stars at 1:1")
+        else:
+            self.viewer.set_image(out, keep_view=True)
+            self.view_caption.setText("Fast preview (the saved image is full resolution)")
+
+    def swap_image(self, img):
+        """Replace the displayed image with one of a different size, keeping the same visible area."""
+        v = self.viewer
+        old_w = max(1.0, v.image_rect().width())
+        c = v.mapToScene(v.viewport().rect().center())
+        rel = (c.x() / old_w, c.y() / max(1.0, v.image_rect().height()))
+        z = v.transform().m11()
+        v.set_image(img, keep_view=True)
+        new_w = v.image_rect().width()
+        v.resetTransform()
+        v.scale(z * old_w / new_w, z * old_w / new_w)
+        v.centerOn(rel[0] * new_w, rel[1] * v.image_rect().height())
+        v.zoomChanged.emit(v.transform().m11())
+
+    def render_full_preview(self, zoom_to_100: bool = True):
+        """Full-resolution render on demand, then show it at true 1:1 pixels."""
+        if not self.project.stacked:
+            return
+        fp = self.finish_params()
+        pr = self.project
+
+        def job(progress):
+            progress(0.2, "Rendering the full-resolution preview…")
+            return apply_finish(pr.result, pr.final_mask, fp)
+
+        def done(img):
+            if self.stack.currentIndex() != 5:
+                return
+            self.swap_image(img)
+            self.full_preview = True
+            if zoom_to_100:
+                v = self.viewer
+                c = v.mapToScene(v.viewport().rect().center())
+                v.resetTransform()
+                ratio = v.devicePixelRatioF() or 1.0   # Retina: one image pixel per screen pixel
+                v.scale(1 / ratio, 1 / ratio)
+                v.centerOn(c)
+                v.zoomChanged.emit(v.transform().m11())
+            h, w = img.shape[:2]
+            self.view_caption.setText(f"100% full resolution ({w}×{h}) - drag to look around; "
+                                      "moving a slider returns to the fast preview")
+            self.statusBar().showMessage("Full-resolution preview ready")
+        self.run_task(job, done)
+
+    def reset_finish(self):
+        """Baseline: no tone changes or clean-up - the stack exactly as shot."""
+        for w, v in ((self.exposure, 0.0), (self.black, 0.0), (self.contrast, 0.0), (self.saturation, 1.0),
+                     (self.asinh, 30.0), (self.stars_boost, 0.0), (self.sky_dn, 0.0), (self.gnd_dn, 0.0)):
+            w.set(v)
+        for cb in (self.gradient, self.neutral, self.highlights, self.linear):
+            cb.setChecked(False)
+        self.tone.setCurrentIndex(0)
+        self.grad_deg.setCurrentIndex(1)
 
     def show_before(self):
         if not self.project.stacked:
             return
-        img = resize_max(self.project.orig.read(self.project.ref_idx), 1600)
+        img = resize_max(self.project.orig.read(self.project.ref_idx), self.preview_size())
         m = cv2.resize(self.project.final_mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
         self.viewer.set_image(apply_finish(img, m, self.finish_params()), keep_view=True)
         self.view_caption.setText("Single frame (before stacking)")
@@ -1190,11 +1360,17 @@ class MainWindow(QMainWindow):
         elif i == 3:
             self.enter_align()
             if self.project.prepared and not self.project.aligned_ok:
-                self.align()
+                if self.pref("auto_align"):
+                    self.align()
+                else:
+                    self.statusBar().showMessage("Choose your options, then click “Align stars”.")
         elif i == 4:
             self.enter_stack()
             if not self.project.stacked:
-                self.do_stack()
+                if self.pref("auto_stack"):
+                    self.do_stack()
+                else:
+                    self.statusBar().showMessage("Choose your options, then click “Stack!”.")
         elif i == 5:
             self.enter_finish()
 
@@ -1255,8 +1431,156 @@ class MainWindow(QMainWindow):
             self.worker.cancelled = True
             self.statusBar().showMessage("Cancelling…")
 
+    # ======================================================================= preferences & help
+    def pref(self, key):
+        from .preferences import GENERAL
+        if key == "auto_update":
+            return self.qsettings.value("auto_update", True, type=bool)
+        return self.qsettings.value(f"pref/{key}", GENERAL[key][1], type=bool)
+
+    def preview_size(self) -> int:
+        return int(self.qsettings.value("pref/preview_size", 1600))
+
+    def setup_help_and_prefs(self):
+        from PySide6.QtWidgets import QApplication, QFormLayout as _QF
+        from .help_text import HELP
+        from .preferences import PROCESSING, SAVING, set_widget_value, widget_value
+        # Hover descriptions on every setting (and on its label in forms).
+        for attr, (name, where, desc) in HELP.items():
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            w.setToolTip(desc)
+            for child in (getattr(w, "slider", None), getattr(w, "spin", None)):
+                if child is not None:
+                    child.setToolTip(desc)
+        for form in self.findChildren(_QF):
+            for r in range(form.rowCount()):
+                li, fi = form.itemAt(r, _QF.LabelRole), form.itemAt(r, _QF.FieldRole)
+                if li and fi and li.widget() and fi.widget() and fi.widget().toolTip():
+                    li.widget().setToolTip(fi.widget().toolTip())
+        # Remember factory values, then apply the user's saved defaults.
+        self.factory_defaults = {a: widget_value(getattr(self, a)) for a in PROCESSING + SAVING}
+        for a in PROCESSING + SAVING:
+            v = self.qsettings.value(f"pref/{a}")
+            if v is not None:
+                set_widget_value(getattr(self, a), v)
+        self.tooltip_filter = TooltipFilter(self)
+        QApplication.instance().installEventFilter(self.tooltip_filter)
+        self.apply_general_prefs()
+
+    def apply_general_prefs(self):
+        self.tooltip_filter.enabled = self.pref("tooltips")
+        self.auto_update_action.blockSignals(True)
+        self.auto_update_action.setChecked(self.pref("auto_update"))
+        self.auto_update_action.blockSignals(False)
+        if self.stack.currentIndex() == 5:
+            self.update_finish_preview()
+
+    def open_preferences(self):
+        from .preferences import PreferencesDialog
+        PreferencesDialog(self).exec()
+
+    # ======================================================================= updates
+    def auto_check_updates(self):
+        import time
+        if not self.qsettings.value("auto_update", True, type=bool):
+            return
+        last = float(self.qsettings.value("last_update_check", 0) or 0)
+        if time.time() - last < 20 * 3600:   # at most about once a day
+            return
+        self.check_updates(silent=True)
+
+    def check_updates(self, silent: bool = True):
+        """Ask GitHub for the latest release (in the background, never blocks the app)."""
+        import time
+        from .. import updater
+        if self._update_worker is not None:
+            return
+        w = Worker(lambda progress: updater.check_latest())
+        self._update_worker = w
+
+        def done(info):
+            self._update_worker = None
+            self.qsettings.setValue("last_update_check", time.time())
+            if not info or not info.get("version"):
+                if not silent:
+                    QMessageBox.information(self, APP_NAME, "No releases are published yet.")
+                return
+            skipped = self.qsettings.value("skip_version", "")
+            if not updater.is_newer(info["version"]):
+                if not silent:
+                    QMessageBox.information(self, APP_NAME, f"You have the latest version ({__version__}).")
+                return
+            if silent and skipped == info["version"]:
+                return
+            self.offer_update(info)
+
+        def failed(msg, tb):
+            self._update_worker = None
+            if not silent:
+                QMessageBox.warning(self, APP_NAME, f"Couldn't check for updates:\n{msg}")
+        w.signals.finished.connect(done)
+        w.signals.failed.connect(failed)
+        self.pool.start(w)
+
+    def offer_update(self, info):
+        from .. import updater
+        ok, reason = updater.can_self_update()
+        box = QMessageBox(self)
+        box.setWindowTitle("Update available")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"<b>NightStack {info['version']}</b> is available. You have {__version__}.")
+        notes = info.get("notes") or ""
+        box.setInformativeText((notes[:600] + ("…" if len(notes) > 600 else "")) if notes else "")
+        if ok and info.get("url"):
+            now = box.addButton("Update Now", QMessageBox.AcceptRole)
+        else:
+            now = box.addButton("Open Download Page", QMessageBox.AcceptRole)
+            if reason:
+                box.setDetailedText(reason)
+        box.addButton("Later", QMessageBox.RejectRole)
+        skip = box.addButton("Skip This Version", QMessageBox.DestructiveRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == skip:
+            self.qsettings.setValue("skip_version", info["version"])
+        elif clicked == now:
+            if ok and info.get("url"):
+                self.install_update(info)
+            else:
+                QDesktopServices.openUrl(QUrl(info.get("page") or updater.RELEASES_PAGE))
+
+    def install_update(self, info):
+        from PySide6.QtWidgets import QApplication
+        from .. import updater
+        if self.project.stacked and QMessageBox.question(
+                self, APP_NAME, "NightStack will restart to finish updating. Your current stack will be "
+                "closed (save your image first if you need it). Continue?") != QMessageBox.Yes:
+            return
+
+        def job(progress):
+            work = updater.new_workdir()
+            z = updater.download(info["url"], os.path.join(work, updater.ASSET_NAME), progress, info.get("size", 0))
+            progress(0.97, "Installing update…")
+            updater.install_and_relaunch(z, workdir=work)
+            return True
+
+        def done(_):
+            self.statusBar().showMessage("Restarting NightStack…")
+            self.close()
+            QApplication.quit()
+        self.run_task(job, done)
+
     # ======================================================================= misc
     def zoom_100(self):
+        if self.stack.currentIndex() == 5 and self.project.stacked:
+            if not getattr(self, "full_preview", False):
+                self.render_full_preview()   # 100% only means something on the full-size image
+                return
+            ratio = self.viewer.devicePixelRatioF() or 1.0
+            self.viewer.zoom_100(ratio)
+            return
         self.viewer.zoom_100(self.project.display_scale if self.stack.currentIndex() in (2, 3) else 1.0)
 
     def _zoom_changed(self, z):

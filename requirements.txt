@@ -6,3 +6,4 @@ scipy>=1.11
 rawpy>=0.19                   # LibRaw: CR2/CR3/NEF/ARW/RAF/ORF/RW2/DNG...
 tifffile>=2023.7
 astropy>=5.3                  # FITS read/write (Siril / PixInsight interchange)
+certifi>=2023.7               # CA certificates for update checks

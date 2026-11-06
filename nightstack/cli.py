@@ -37,7 +37,7 @@ def main(argv=None):
     ap.add_argument("--no-foreground", action="store_true")
     ap.add_argument("--linear", action="store_true", help="save linear data")
     ap.add_argument("--layers", action="store_true", help="also save sky/foreground/mask")
-    ap.add_argument("--exposure", type=float, default=None, help="EV (default: auto)")
+    ap.add_argument("--exposure", default="0", help="EV, or 'auto' (default: 0 = as shot)")
     a = ap.parse_args(argv)
 
     def expand(items):
@@ -79,7 +79,7 @@ def main(argv=None):
                           remove_gradient=a.remove_gradient)
         if a.astro_stretch is not None:
             fp.tone, fp.asinh_strength = "asinh", a.astro_stretch
-        fp.exposure = a.exposure if a.exposure is not None else pr.suggest_exposure(fp.black_point)
+        fp.exposure = pr.suggest_exposure(fp.black_point) if a.exposure == "auto" else float(a.exposure)
         files = pr.export(a.output, fp, bits=32 if a.output.lower().endswith((".fit", ".fits")) else 16,
                           layers=a.layers, progress=prog)
         if a.timelapse:

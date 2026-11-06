@@ -16,7 +16,7 @@ from .imageio import (RAW_EXTS, FrameCache, load_cfa, load_image, new_cache_dir,
                       save_image, to_gray)
 from .postprocess import FinishParams, apply_finish, auto_exposure
 from .skymask import SkyMaskModel, auto_detect, stretch_for_display
-from .stack import blend, combine
+from .stack import blend, combine, small_stack_method
 from .stars import detect_stars, snap_to_star
 
 
@@ -53,6 +53,7 @@ class Settings:
     auto_reject: bool = True         # drop blurry / cloudy frames automatically
     match_foreground: bool = True    # scale separate foreground photos to the night frames
     ground_frame: Optional[int] = None  # "best single frame": chosen frame (None = automatic)
+    auto_small_stack: bool = True    # <10 frames: use min/max (or median) instead of sigma-type clipping
 
 
 @dataclass
@@ -92,6 +93,7 @@ class Project:
         self.n_sky = 0
         self.hot_count = 0
         self.ground_choice = None        # (label, scores) of the frame used by "best single frame"
+        self.method_notes: List[str] = []  # automatic method changes, shown to the user
         self.prepared = self.aligned_ok = self.stacked = False
 
     # ------------------------------------------------------------------ housekeeping
@@ -336,7 +338,7 @@ class Project:
         progress(1.0, f"Aligned {sum(r.ok for r in res)} of {n} frames")
         return res
 
-    def score_ground_frames(self, cache, idx, scale=None) -> np.ndarray:
+    def score_ground_frames(self, cache, idx, scale=None, progress: Progress = _noop) -> np.ndarray:
         """Score each candidate foreground frame (lower = better).
 
         A good frame looks like the consensus (median) of all frames - no headlights, people,
@@ -362,6 +364,7 @@ class Project:
         gm = np.ones((len(cand), t, t), bool)
         lum = []
         for k, i in enumerate(idx):
+            progress(0.02, f"Checking foreground frame {k + 1} of {len(idx)}")
             f = np.stack([np.asarray(cache.mm[i, y:y + t, x:x + t], np.float32) for y, x in cand])
             if scale is not None:
                 f = f * scale[k]
@@ -459,6 +462,7 @@ class Project:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * s.horizon_margin + 1,) * 2) \
                 if s.horizon_margin > 0 else None
             for j, i in enumerate(sky_idx):
+                progress(0.0, f"Preparing frame {j + 1} of {len(sky_idx)}")   # also lets Cancel stop here
                 v = (np.asarray(self.valid.mm[i]) > 200).astype(np.uint8)
                 if k is not None:
                     v = cv2.erode(v, k)
@@ -473,6 +477,7 @@ class Project:
             gmask = np.ones_like(gmask)
 
         def chan_stats(arr, m):
+            progress(0.01, "Measuring frames")
             px = arr[m] if m.any() else arr.reshape(-1, 3)
             loc = np.median(px, 0)
             return loc, 1.4826 * np.median(np.abs(px - loc), 0) + 1e-7
@@ -508,7 +513,7 @@ class Project:
         self.ground_choice = None
         if s.ground_method == "best":
             progress(0.02, "Choosing the best foreground frame")
-            scores = self.score_ground_frames(g_cache, g_idx, g_scale)
+            scores = self.score_ground_frames(g_cache, g_idx, g_scale, progress)
             if s.ground_frame is not None and s.ground_frame in g_idx:
                 best_pos = g_idx.index(s.ground_frame)
                 how = "your choice"
@@ -519,6 +524,22 @@ class Project:
             self.ground_choice = (f"{os.path.basename(names[g_idx[best_pos]])} ({how})", scores, g_idx[best_pos])
             if len(g_idx) > 1:
                 fill = np.zeros((H, W, 3), np.float32)
+        # Short sequences: sigma-type clipping can't estimate a spread from 4-9 samples (one airplane
+        # streak inflates it), so switch to min/max rejection, or median for 3 frames or fewer.
+        sky_method, ground_method = s.sky_method, s.ground_method
+        self.method_notes = []
+        if s.auto_small_stack:
+            names = {"minmax": "min/max rejection", "median": "median"}
+            if s.mode == "landscape":
+                sky_method = small_stack_method(s.sky_method, len(sky_idx))
+                if sky_method != s.sky_method:
+                    self.method_notes.append(f"Sky: {len(sky_idx)} frames, so {names[sky_method]} was used "
+                                             "instead of sigma-type clipping (removes airplane streaks).")
+            if s.ground_method != "best":
+                ground_method = small_stack_method(s.ground_method, len(g_idx))
+                if ground_method != s.ground_method:
+                    self.method_notes.append(f"Foreground: {len(g_idx)} frames, so {names[ground_method]} was "
+                                             "used.")
         workers = max(1, min(4, (os.cpu_count() or 2)))
         nbytes = max(len(sky_idx), len(g_idx)) * W * 3 * 4 * 8
         step = int(np.clip(160e6 // max(nbytes, 1), 8, 256))
@@ -535,7 +556,7 @@ class Project:
                 if fill is not None:
                     fill[r0:r1], _ = combine(g, None, "median")
             else:
-                gnd[r0:r1], _ = combine(g, None, s.ground_method, s.kappa)
+                gnd[r0:r1], _ = combine(g, None, ground_method, s.kappa)
             if s.mode == "trails":
                 t = self.orig.rows(r0, r1, enabled) if self.fg is not None else g
                 sky[r0:r1], _ = combine(t, None, "max")
@@ -547,21 +568,23 @@ class Project:
                     for k, (L, kk, L0) in enumerate(sky_norm):
                         d[k] = (d[k] - L) * kk + L0
                 v = np.asarray(vmm[:, r0:r1]) > 0
-                sky[r0:r1], cnt[r0:r1] = combine(d, v, s.sky_method, s.kappa, weights=sky_w)
+                sky[r0:r1], cnt[r0:r1] = combine(d, v, sky_method, s.kappa, weights=sky_w)
 
         from concurrent.futures import ThreadPoolExecutor
+        # No `with` block: its exit waits for *every* queued strip, which made Cancel slow.
+        ex = ThreadPoolExecutor(workers)   # numpy releases the GIL: real multi-core speed-up
         futures = []
         try:
-            with ThreadPoolExecutor(workers) as ex:  # numpy releases the GIL: real multi-core speed-up
-                futures = [ex.submit(do_strip, r) for r in strips]
-                for k, f in enumerate(futures):
-                    f.result()
-                    progress(k / len(futures), f"Stacking ({100 * k // len(futures)}%)")
+            futures = [ex.submit(do_strip, r) for r in strips]
+            for k, f in enumerate(futures):
+                f.result()
+                progress(k / len(futures), f"Stacking ({100 * k // len(futures)}%)")
         except BaseException:
             for f in futures:
                 f.cancel()
             raise
         finally:
+            ex.shutdown(wait=True, cancel_futures=True)   # only waits for the few strips already running
             if vtmp is not None:
                 vtmp.close()
         progress(0.97, "Blending sky and foreground")

@@ -67,6 +67,16 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python main.py
 ```
 
+## Updating
+NightStack 1.3 and later update themselves: when a new version is published, the app offers to install
+it (checked about once a day, or **Help → Check for Updates…**). Every version is also listed under
+[Releases](https://github.com/jphunter16/NightStack/releases).
+
+## Preferences
+**NightStack → Preferences…** (⌘,) or the ⚙ button: hover descriptions on/off, automatic update checks,
+whether Align / Stack start by themselves, preview size, your default processing settings, default save
+format, a searchable list of every setting, and cache cleanup.
+
 ## Batch / command line
 ```bash
 python -m nightstack ~/Pictures/MilkyWay/*.CR2 -o milkyway.tif --darks darks/*.CR2 --layers

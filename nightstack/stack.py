@@ -14,6 +14,7 @@ SKY_METHODS = {
     "linear": "Linear-fit clipping  (best when sky brightness drifts)",
     "mad": "MAD clipping  (very robust, few frames)",
     "percentile": "Percentile clipping  (for 3-6 frames)",
+    "minmax": "Min/max rejection  (best for 4-9 frames)",
     "median": "Median  (robust, slightly noisier)",
     "mean": "Mean  (lowest noise, keeps planes)",
     "max": "Maximum  (lighten)",
@@ -22,6 +23,7 @@ GROUND_METHODS = {
     "median": "Median  (removes moving cars / people)",
     "sigma": "Sigma-clipped mean",
     "winsor": "Winsorized sigma",
+    "minmax": "Min/max rejection",
     "mean": "Mean  (lowest noise)",
     "best": "Best single frame  (crisp trees / water)",
 }
@@ -30,6 +32,17 @@ BLEND_MODES = {
     "standard": "Standard feathered edge",
 }
 CLIP_METHODS = ("sigma", "winsor", "linear", "mad", "percentile")
+# These estimate a spread from the samples themselves, which is unreliable with few frames:
+# one airplane streak inflates sigma so much that the streak survives the clipping.
+STATISTICAL_METHODS = CLIP_METHODS
+SMALL_STACK = 10   # below this many frames, statistical clipping is swapped for min/max or median
+
+
+def small_stack_method(method: str, n_frames: int) -> str:
+    """Pick a rejection that works for short sequences (applied automatically)."""
+    if method not in STATISTICAL_METHODS or n_frames >= SMALL_STACK:
+        return method
+    return "median" if n_frames <= 3 else "minmax"
 
 
 def combine(data: np.ndarray, valid: Optional[np.ndarray], method: str, kappa: float = 2.5,
@@ -48,6 +61,8 @@ def combine(data: np.ndarray, valid: Optional[np.ndarray], method: str, kappa: f
         out = np.where(v, data, -np.inf).max(0)
     elif method == "median":
         out = fast_nanmedian(np.where(v, data, np.nan), 0)
+    elif method == "minmax":
+        out = minmax_reject(data, v, w)
     elif method == "mean" or (method in CLIP_METHODS and n < 3):
         wv = v * w[:, None, None, None]
         out = (data * wv).sum(0) / np.maximum(wv.sum(0), 1e-12)
@@ -66,6 +81,29 @@ def _gather(arr: np.ndarray, idx: np.ndarray) -> np.ndarray:
     p = idx.size
     flat = idx.ravel().astype(np.int64) * p + np.arange(p, dtype=np.int64)
     return np.take(arr.reshape(n * p), flat).reshape(idx.shape)
+
+
+def minmax_reject(data, v, w, k: int = 1) -> np.ndarray:
+    """Drop the k highest and k lowest samples of each pixel, weighted-average the rest.
+
+    An airplane / satellite crosses a pixel in one frame, so it is the highest sample there
+    and is removed no matter how few frames there are.  Pixels with fewer than 2k+1 valid
+    samples (near the horizon) keep what they have.
+    """
+    d = np.where(v, data, np.nan)
+    order = np.argsort(d, axis=0)
+    srt = np.take_along_axis(d, order, 0)
+    n_valid = np.sum(~np.isnan(srt), 0)
+    z = np.nan_to_num(srt)
+    N = z.shape[0]
+    ws = np.take_along_axis(np.broadcast_to(w[:, None, None, None], d.shape), order, 0) * (~np.isnan(srt))
+    kk = np.where(n_valid >= 2 * k + 1, k, 0)
+    lo, hi = kk, n_valid - kk
+    zero = np.zeros((1,) + z.shape[1:], np.float32)
+    cw = np.concatenate([zero, np.cumsum(ws, 0, dtype=np.float32)], 0)
+    cwz = np.concatenate([zero, np.cumsum(ws * z, 0, dtype=np.float32)], 0)
+    out = (_gather(cwz, hi) - _gather(cwz, lo)) / np.maximum(_gather(cw, hi) - _gather(cw, lo), 1e-12)
+    return out.astype(np.float32)
 
 
 def _window(keep: np.ndarray, lo: np.ndarray, hi: np.ndarray):

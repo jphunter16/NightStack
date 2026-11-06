@@ -29,10 +29,17 @@ QListWidget#Steps::item:selected {{ background: #243256; color: white; }}
 QListWidget#Steps::item:disabled {{ color: #4d5361; }}
 QListWidget, QTableWidget {{ background: #12151a; border: 1px solid #2a2f3a; border-radius: 6px; }}
 QHeaderView::section {{ background: #1d2129; color: #aab4c8; border: none; padding: 4px; }}
-QComboBox, QSpinBox, QDoubleSpinBox {{ background: #222731; border: 1px solid #343a47; border-radius: 6px;
+QDoubleSpinBox {{ background: #222731; border: 1px solid #343a47; border-radius: 6px; padding-right: 4px; }}
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ subcontrol-origin: border; width: 0px; height: 0px;
+                                                         border: none; }}
+QDoubleSpinBox:focus {{ border: 1px solid {ACCENT}; }}
+QComboBox, QSpinBox {{ background: #222731; border: 1px solid #343a47; border-radius: 6px;
                                       padding: 4px 6px; }}
-QSlider::groove:horizontal {{ height: 4px; background: #2c3240; border-radius: 2px; }}
-QSlider::handle:horizontal {{ background: {ACCENT}; width: 14px; margin: -6px 0; border-radius: 7px; }}
+QSlider {{ min-height: 22px; background: transparent; }}
+QSlider::groove:horizontal {{ height: 4px; background: #2c3240; border-radius: 2px; margin: 0 7px; }}
+QSlider::handle:horizontal {{ background: {ACCENT}; border: 2px solid #c9d6ff; width: 12px; height: 12px;
+                             margin: -6px -7px; border-radius: 8px; }}
+QSlider::handle:horizontal:hover {{ background: #7aa2ff; }}
 QSlider::sub-page:horizontal {{ background: #3e5cab; border-radius: 2px; }}
 QProgressBar {{ background: #1d2129; border: 1px solid #2a2f3a; border-radius: 5px; text-align: center;
                height: 16px; }}

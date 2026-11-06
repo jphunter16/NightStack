@@ -12,15 +12,15 @@ from .imageio import linear_to_srgb, to_gray
 @dataclass
 class FinishParams:
     exposure: float = 0.0          # EV
-    black_point: float = 0.5       # fraction of sky background removed
-    saturation: float = 1.15
+    black_point: float = 0.0       # fraction of sky background removed
+    saturation: float = 1.0
     contrast: float = 0.0          # -1..1
     remove_gradient: bool = False
     gradient_degree: int = 2
-    neutralize: bool = True
+    neutralize: bool = False
     sky_denoise: float = 0.0       # 0..1
     ground_denoise: float = 0.0    # 0..1
-    protect_highlights: bool = True
+    protect_highlights: bool = False
     linear_output: bool = False
     enhance_stars: float = 0.0     # 0..1  (Sequator "Enhance star light")
     tone: str = "natural"          # natural | asinh (colour-preserving astro stretch, Siril-style)
